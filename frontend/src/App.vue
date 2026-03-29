@@ -1,7 +1,7 @@
 <template>
   <div id="shell">
     <!-- Topbar -->
-    <div class="topbar">
+    <div class="topbar" v-if="showTopbar">
       <div class="tb-brand" @click="router.push('/')" style="cursor:pointer">CrowdSim</div>
       <div class="tb-sep"></div>
       <div class="tb-phases">
@@ -60,11 +60,46 @@
           <span v-if="isDark">&#9788;</span>
           <span v-else>&#9790;</span>
         </button>
+        <div v-if="isAuthenticated" class="tb-user-wrap" ref="userWrap">
+          <button class="tb-user" @click="userMenuOpen = !userMenuOpen" :class="{ open: userMenuOpen }">
+            <span class="tb-user-dot"></span>
+            <span class="tb-user-name">{{ displayName }}</span>
+            <span class="tb-user-credit font-mono" v-if="usageDisplay">{{ usageDisplay }}</span>
+          </button>
+          <Transition name="dd">
+            <div class="user-dropdown" v-if="userMenuOpen">
+              <div class="ud-head">
+                <span class="ud-label font-mono">ACCOUNT</span>
+              </div>
+              <div class="ud-body">
+                <div class="ud-row">
+                  <span class="ud-row-label">Tier</span>
+                  <span class="ud-row-value">{{ userInfo?.is_free_tier ? 'Free' : 'Paid' }}</span>
+                </div>
+                <div class="ud-row" v-if="usageDisplay">
+                  <span class="ud-row-label">Usage</span>
+                  <span class="ud-row-value ud-credit">{{ usageDisplay }}</span>
+                </div>
+                <div class="ud-row" v-if="userInfo?.limit != null">
+                  <span class="ud-row-label">Limit</span>
+                  <span class="ud-row-value font-mono">{{ userInfo.limit != null ? `$${userInfo.limit}` : 'Unlimited' }}</span>
+                </div>
+                <div class="ud-row" v-if="userInfo?.limit_remaining != null">
+                  <span class="ud-row-label">Remaining</span>
+                  <span class="ud-row-value font-mono">${{ userInfo.limit_remaining.toFixed(2) }}</span>
+                </div>
+              </div>
+              <div class="ud-actions">
+                <button class="ud-logout" @click="handleLogout">Logout</button>
+              </div>
+            </div>
+          </Transition>
+        </div>
       </div>
     </div>
 
     <!-- Click-outside overlay -->
-    <div class="hist-backdrop" v-if="historyOpen" @click="historyOpen = false"></div>
+    <div class="hist-backdrop" v-if="showTopbar && (historyOpen || userMenuOpen)" @click="historyOpen = false; userMenuOpen = false"></div>
 
     <div class="tb-body">
       <router-view />
@@ -76,9 +111,37 @@
 import { computed, ref, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from './api'
+import { useAuth } from './composables/useAuth'
 
 const route = useRoute()
 const router = useRouter()
+const { isAuthenticated, userInfo, logout } = useAuth()
+
+const displayName = computed(() => {
+  const u = userInfo.value
+  if (!u) return 'Connected'
+  if (u.is_free_tier) return 'Free Tier'
+  return 'OpenRouter'
+})
+
+const usageDisplay = computed(() => {
+  const u = userInfo.value
+  if (!u || u.usage == null) return null
+  return `$${u.usage.toFixed(2)}`
+})
+
+const userMenuOpen = ref(false)
+const userWrap = ref(null)
+
+const showTopbar = computed(() => {
+  const name = route.name
+  return name !== 'login' && name !== 'auth-callback'
+})
+
+function handleLogout() {
+  logout()
+  router.push('/login')
+}
 
 const phases = [
   { name: 'compose', label: 'Compose', path: '/' },
@@ -122,7 +185,7 @@ function goToScenario(s) {
 }
 
 // Close on navigation
-watch(() => route.path, () => { historyOpen.value = false })
+watch(() => route.path, () => { historyOpen.value = false; userMenuOpen.value = false })
 
 // Theme toggle
 const isDark = ref(false)
@@ -422,6 +485,138 @@ onMounted(() => {
 .tb-theme:hover {
   color: var(--text);
   border-color: var(--border2);
+}
+
+/* User menu */
+.tb-user-wrap {
+  position: relative;
+}
+
+.tb-user {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text3);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.tb-user:hover {
+  border-color: var(--border2);
+  color: var(--text2);
+}
+
+.tb-user.open {
+  border-color: var(--green-border);
+  color: var(--green);
+  background: var(--green-bg);
+}
+
+.tb-user-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--green);
+}
+
+.tb-user-name {
+  letter-spacing: -0.01em;
+  font-size: 10px;
+}
+
+.tb-user-credit {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--green-bg);
+  color: var(--green);
+}
+
+.tb-user.open .tb-user-credit {
+  background: var(--green);
+  color: #fff;
+}
+
+.user-dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  width: 240px;
+  background: var(--white);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.12);
+  overflow: hidden;
+  z-index: 200;
+}
+
+.ud-head {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.ud-label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: var(--text3);
+}
+
+.ud-body {
+  padding: 6px 0;
+}
+
+.ud-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 12px;
+}
+
+.ud-row-label {
+  font-size: 11px;
+  color: var(--text3);
+}
+
+.ud-row-value {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.ud-credit {
+  color: var(--green);
+}
+
+.ud-actions {
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: flex-end;
+}
+
+.ud-logout {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--red);
+  padding: 5px 14px;
+  border-radius: 5px;
+  border: 1px solid var(--red-border);
+  background: var(--red-bg);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.ud-logout:hover {
+  background: var(--red);
+  color: #fff;
 }
 
 .tb-body {

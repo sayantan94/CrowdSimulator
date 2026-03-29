@@ -64,6 +64,29 @@
         </div>
 
         <div class="ed-right-scroll">
+          <!-- Models -->
+          <div class="ed-field">
+            <label class="field-label">LLM Model</label>
+            <div class="model-input-wrap">
+              <input
+                v-model="modelInput"
+                class="model-input"
+                placeholder="openrouter model id"
+                spellcheck="false"
+              />
+            </div>
+            <label class="field-label" style="margin-top:12px">Search Model</label>
+            <div class="model-input-wrap">
+              <input
+                v-model="searchModelInput"
+                class="model-input"
+                placeholder="openrouter search model id"
+                spellcheck="false"
+              />
+            </div>
+            <a class="model-browse" href="https://openrouter.ai/models" target="_blank" rel="noopener">Browse models &#8599;</a>
+          </div>
+
           <!-- Audience -->
           <div class="ed-field">
             <label class="field-label">Target Audience</label>
@@ -228,6 +251,10 @@ const defaultAngles = [
 
 const activeAngles = ref(defaultAngles.map(a => a.id))
 
+// Model selection — user types any OpenRouter model ID
+const modelInput = ref('x-ai/grok-4.1-fast')
+const searchModelInput = ref('perplexity/sonar')
+
 const agentPresets = [15, 50, 200, 1000, 10000]
 
 const platformOptions = [
@@ -330,6 +357,8 @@ function handleSubmit() {
     agent_count: agentCount.value,
     rounds: rounds.value,
     research_topics: buildResearchTopics(),
+    model: modelInput.value.trim() || undefined,
+    search_model: searchModelInput.value.trim() || undefined,
   }
   if (abMode.value) {
     payload.variants = variants.value.map(v => ({ id: v.id, text: v.text.trim() }))
@@ -636,6 +665,40 @@ function handleSubmit() {
 
 .rf-add-btn:hover:not(:disabled) { border-color: var(--border2); color: var(--text); }
 .rf-add-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+/* Model input */
+.model-input-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.model-input {
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--panel-glass);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: var(--mono, monospace);
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.12s;
+}
+
+.model-input:focus { border-color: var(--border2); }
+.model-input::placeholder { color: var(--text3); }
+
+.model-browse {
+  font-size: 10px;
+  color: var(--text3);
+  text-decoration: none;
+  transition: color 0.12s;
+  align-self: flex-end;
+}
+
+.model-browse:hover { color: var(--blue); }
 
 /* Platforms */
 .ed-plats { display: flex; gap: 8px; }

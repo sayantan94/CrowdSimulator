@@ -8,6 +8,7 @@
  */
 import { reactive, computed } from 'vue'
 import { connectWS } from '../api'
+import { useAuth } from './useAuth'
 
 // Tool icons — matches x-lens style
 const TOOL_ICONS = {
@@ -364,6 +365,8 @@ function handleEvent(msg) {
       state.simulationComplete = true
       state.phase = 'complete'
       state.phaseLabel = 'Simulation complete'
+      // Refresh usage info after simulation
+      try { useAuth().refreshUserInfo() } catch {}
       break
 
     case 'simulation_error': {

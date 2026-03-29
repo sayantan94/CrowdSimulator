@@ -1,6 +1,17 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { useAuth } from '../composables/useAuth'
 
 const routes = [
+  {
+    path: '/login',
+    name: 'login',
+    component: () => import('../views/LoginView.vue')
+  },
+  {
+    path: '/auth/callback',
+    name: 'auth-callback',
+    component: () => import('../views/AuthCallbackView.vue')
+  },
   {
     path: '/',
     name: 'compose',
@@ -26,6 +37,15 @@ const routes = [
 const router = createRouter({
   history: createWebHistory(),
   routes
+})
+
+router.beforeEach((to) => {
+  const { isAuthenticated } = useAuth()
+
+  const publicRoutes = ['login', 'auth-callback']
+  if (!publicRoutes.includes(to.name) && !isAuthenticated.value) {
+    return { name: 'login' }
+  }
 })
 
 export default router

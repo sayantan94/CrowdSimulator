@@ -33,8 +33,10 @@ interface Scenario {
   agent_count: number;
   rounds: number;
   model?: string;
+  search_model?: string;
   status: string;
   research_topics: string[];  // user-specified research angles
+  apiKey?: string;            // per-user OpenRouter API key (never persisted)
 }
 
 interface SimulationResults {
@@ -100,7 +102,7 @@ async function saveHistory() {
   try {
     mkdirSync(CROWDSIM_HOME, { recursive: true });
     const data = {
-      scenarios: [...scenarios.values()],
+      scenarios: [...scenarios.values()].map(({ apiKey: _, ...s }) => s),
       results: Object.fromEntries(results),
     };
     await writeFile(HISTORY_FILE, JSON.stringify(data, null, 2));
@@ -112,13 +114,15 @@ async function saveHistory() {
 loadHistory();
 
 // ---------------------------------------------------------------------------
-// Persistent agent — survives across simulation runs, builds memory
+// Per-simulation active session — each simulation creates its own
 // ---------------------------------------------------------------------------
 
-let persistentAgent: Agent | null = null;
-let agentBusy = false;
+// Track active sessions by scenario ID so the WS handler can find them
+const activeSessions = new Map<string, ActiveSession>();
 
-const active: ActiveSession = { ws: null, phase: "idle", pipelinePhase: 0, finalContent: "", lastAgentError: "", toolStarts: new Map(), confirmResolve: null, profilesSent: false, collectedAgents: [], collectedActions: [], collectedSources: [] };
+function createActiveSession(): ActiveSession {
+  return { ws: null, phase: "idle", pipelinePhase: 0, finalContent: "", lastAgentError: "", toolStarts: new Map(), confirmResolve: null, profilesSent: false, collectedAgents: [], collectedActions: [], collectedSources: [] };
+}
 
 const SYSTEM_PROMPT = `You are CrowdSimulator, an AI agent that predicts how audiences will react to social media posts before they are published.
 
@@ -226,9 +230,10 @@ function resolveModel(provider: string, modelId?: string): Model<any> {
   if (provider === "openrouter") {
     const id = modelId || "anthropic/claude-sonnet-4";
     return getModel("openrouter", id as any);
+  } else {
+    const id = modelId || "anthropic.claude-sonnet-4-20250514-v1:0";
+    return getModel("amazon-bedrock", id as any);
   }
-  const id = modelId || "anthropic.claude-sonnet-4-20250514-v1:0";
-  return getModel("amazon-bedrock", id as any);
 }
 
 function convertToLlm(messages: any[]): Message[] {
@@ -360,10 +365,10 @@ async function transformContext(messages: any[]): Promise<any[]> {
 }
 
 // ---------------------------------------------------------------------------
-// Agent event handler — uses mutable `active` session state
+// Agent event handler — uses the passed-in `active` session state
 // ---------------------------------------------------------------------------
 
-function handleAgentEvent(event: AgentEvent) {
+function handleAgentEvent(event: AgentEvent, active: ActiveSession) {
   const ws = active.ws;
   const wsOpen = ws && ws.readyState === ws.OPEN;
 
@@ -627,27 +632,25 @@ function handleAgentEvent(event: AgentEvent) {
 }
 
 // ---------------------------------------------------------------------------
-// Get or create persistent agent
+// Create a fresh agent per simulation (per-user API key)
 // ---------------------------------------------------------------------------
 
-function getOrCreateAgent(): Agent {
-  if (persistentAgent) return persistentAgent;
-
+function createAgentForSimulation(active: ActiveSession, apiKey?: string, userModel?: string, searchModel?: string): Agent {
   const provider = process.env.CS_LLM_PROVIDER || "openrouter";
-  const modelId = process.env.CS_LLM_MODEL;
+  const modelId = userModel || process.env.CS_LLM_MODEL;
   const model = resolveModel(provider, modelId);
 
   mkdirSync(DATA_DIR, { recursive: true });
 
   const tools = [
-    createWebSearchTool(),
+    createWebSearchTool({ searchModel: searchModel || process.env.CS_SEARCH_MODEL, apiKey }),
     createFetchTool(),
     createShellTool(DATA_DIR),
-    createRunOasisTool(DATA_DIR),
+    createRunOasisTool(DATA_DIR, { apiKey }),
     createReadResultsTool(DATA_DIR),
   ];
 
-  persistentAgent = new Agent({
+  const agent = new Agent({
     initialState: {
       systemPrompt: SYSTEM_PROMPT,
       model,
@@ -656,13 +659,14 @@ function getOrCreateAgent(): Agent {
     },
     convertToLlm,
     transformContext,
+    getApiKey: apiKey ? () => apiKey : undefined,
   });
 
-  // Single subscription — uses mutable `active` session state
-  persistentAgent.subscribe(handleAgentEvent);
+  // Subscribe with the session-scoped `active` state
+  agent.subscribe((event) => handleAgentEvent(event, active));
 
-  console.log(`Agent created with provider=${provider} model=${modelId || "(default)"}`);
-  return persistentAgent;
+  console.log(`Agent created with provider=${provider} model=${modelId || "(default)"} apiKey=${apiKey ? "user-provided" : "env"}`);
+  return agent;
 }
 
 // ---------------------------------------------------------------------------
@@ -739,6 +743,7 @@ async function runOasisDirect(
   rounds: number,
   postText: string,
   workDir: string,
+  active: ActiveSession,
 ): Promise<void> {
   const profilesPath = join(workDir, `profiles_${platform}.json`);
   await writeFile(profilesPath, JSON.stringify(profiles, null, 2));
@@ -830,11 +835,9 @@ async function runOasisDirect(
 // ---------------------------------------------------------------------------
 
 async function runSimulation(ws: WebSocket, scenario: Scenario) {
-  if (agentBusy) {
-    throw new Error("Agent is busy with another simulation. Please wait and try again.");
-  }
-
-  agentBusy = true;
+  // Each simulation gets its own session state and agent
+  const active = createActiveSession();
+  activeSessions.set(scenario.id, active);
   active.ws = ws;
   active.phase = "researching";
   active.pipelinePhase = 1;
@@ -842,8 +845,14 @@ async function runSimulation(ws: WebSocket, scenario: Scenario) {
   active.profilesSent = false;
   active.confirmResolve = null;
 
+  const userApiKey = scenario.apiKey;
+  if (!userApiKey) {
+    throw new Error("No API key available. Please log in with your OpenRouter key.");
+  }
+  console.log(`[sim] API key: user-provided, prefix: ${userApiKey.slice(0, 12)}...`);
+
   try {
-    const agent = getOrCreateAgent();
+    const agent = createAgentForSimulation(active, userApiKey, scenario.model, scenario.search_model);
 
     const workDir = join(DATA_DIR, scenario.id);
     mkdirSync(workDir, { recursive: true });
@@ -851,8 +860,8 @@ async function runSimulation(ws: WebSocket, scenario: Scenario) {
     const platforms = scenario.platforms.join(" and ");
     const isAB = scenario.variants.length > 1;
 
-    const modelId = process.env.CS_LLM_MODEL || "anthropic/claude-sonnet-4";
-    const searchModel = process.env.CS_SEARCH_MODEL || "perplexity/sonar";
+    const modelId = scenario.model || process.env.CS_LLM_MODEL || "anthropic/claude-sonnet-4";
+    const searchModel = scenario.search_model || process.env.CS_SEARCH_MODEL || "perplexity/sonar";
 
     console.log(`[sim] Starting simulation for scenario ${scenario.id}`);
     console.log(`[sim] Model: ${modelId}, Search: ${searchModel}`);
@@ -1076,7 +1085,7 @@ DO NOT call run_oasis_simulation yet — the user needs to review and confirm th
 
       for (const plat of scenario.platforms) {
         try {
-          await runOasisDirect(ws, plat, profiles, simRounds, postText, variantDir);
+          await runOasisDirect(ws, plat, profiles, simRounds, postText, variantDir, active);
         } catch (err: any) {
           console.error(`[sim] Platform ${plat} failed: ${err.message}`);
           wsSend(ws, "simulation_error", {
@@ -1280,7 +1289,7 @@ Your FINAL response must be ONLY a JSON object with these fields:
     active.collectedAgents = [];
     active.collectedActions = [];
     active.collectedSources = [];
-    agentBusy = false;
+    activeSessions.delete(scenario.id);
   }
 }
 
@@ -1288,12 +1297,24 @@ Your FINAL response must be ONLY a JSON object with these fields:
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-function jsonResponse(res: ServerResponse, status: number, data: any) {
+const ALLOWED_ORIGINS = new Set([
+  "https://crowdsim.agentdex.store",
+  "http://localhost:5173",
+  "http://localhost:3000",
+]);
+
+function getCorsOrigin(req: IncomingMessage): string {
+  const origin = req.headers.origin || "";
+  return ALLOWED_ORIGINS.has(origin) ? origin : "";
+}
+
+function jsonResponse(res: ServerResponse, status: number, data: any, req?: IncomingMessage) {
+  const origin = req ? getCorsOrigin(req) : "";
   res.writeHead(status, {
     "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
+    ...(origin ? { "Access-Control-Allow-Origin": origin } : {}),
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
   });
   res.end(JSON.stringify(data));
 }
@@ -1331,10 +1352,11 @@ const PORT = parseInt(process.env.PORT || "8000");
 
 const httpServer = createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
+    const origin = getCorsOrigin(req);
     res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
+      ...(origin ? { "Access-Control-Allow-Origin": origin } : {}),
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
     });
     res.end();
     return;
@@ -1344,10 +1366,19 @@ const httpServer = createServer(async (req, res) => {
   const path = url.pathname;
 
   try {
+    // GET /api/health
+    if (req.method === "GET" && path === "/api/health") {
+      return jsonResponse(res, 200, { status: "ok", version: "1.0.0" }, req);
+    }
+
     // POST /api/scenarios
     if (req.method === "POST" && path === "/api/scenarios") {
       const body = await parseBody(req);
       const id = randomUUID().replace(/-/g, "").slice(0, 12);
+
+      // Extract API key from Authorization header
+      const authHeader = req.headers.authorization || "";
+      const bearerKey = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
 
       // Build variants array
       let variants: Variant[] = [];
@@ -1370,39 +1401,45 @@ const httpServer = createServer(async (req, res) => {
         agent_count: body.agent_count ?? 15,
         rounds: body.rounds ?? 5,
         model: body.model,
+        search_model: body.search_model,
         status: "created",
         research_topics: Array.isArray(body.research_topics) ? body.research_topics.filter((t: any) => typeof t === "string" && t.trim()) : [],
+        ...(bearerKey ? { apiKey: bearerKey } : {}),
       };
       scenarios.set(id, scenario);
       saveHistory();
-      return jsonResponse(res, 200, scenario);
+
+      // Return scenario without the apiKey
+      const { apiKey: _omit, ...safeScenario } = scenario;
+      return jsonResponse(res, 200, safeScenario, req);
     }
 
     // GET /api/scenarios
     if (req.method === "GET" && path === "/api/scenarios") {
-      return jsonResponse(res, 200, [...scenarios.values()]);
+      return jsonResponse(res, 200, [...scenarios.values()].map(({ apiKey: _, ...s }) => s), req);
     }
 
     // GET /api/scenarios/:id
     const scenarioMatch = path.match(/^\/api\/scenarios\/([^/]+)$/);
     if (req.method === "GET" && scenarioMatch) {
       const s = scenarios.get(scenarioMatch[1]);
-      if (!s) return jsonResponse(res, 404, { detail: "Scenario not found" });
-      return jsonResponse(res, 200, s);
+      if (!s) return jsonResponse(res, 404, { detail: "Scenario not found" }, req);
+      const { apiKey: _, ...safe } = s;
+      return jsonResponse(res, 200, safe, req);
     }
 
     // GET /api/results/:id
     const resultsMatch = path.match(/^\/api\/results\/([^/]+)$/);
     if (req.method === "GET" && resultsMatch) {
       const r = results.get(resultsMatch[1]);
-      if (!r) return jsonResponse(res, 404, { detail: "Results not found" });
-      return jsonResponse(res, 200, r);
+      if (!r) return jsonResponse(res, 404, { detail: "Results not found" }, req);
+      return jsonResponse(res, 200, r, req);
     }
 
-    jsonResponse(res, 404, { detail: "Not found" });
+    jsonResponse(res, 404, { detail: "Not found" }, req);
   } catch (err: any) {
     console.error("HTTP error:", err);
-    jsonResponse(res, 500, { detail: err.message || "Internal server error" });
+    jsonResponse(res, 500, { detail: err.message || "Internal server error" }, req);
   }
 });
 
@@ -1427,15 +1464,30 @@ httpServer.on("upgrade", (req, socket, head) => {
         return;
       }
 
+      // Read per-user API key from query parameter (overrides the one from POST)
+      const wsKey = url.searchParams.get("apiKey") || url.searchParams.get("key");
+      if (wsKey) {
+        scenario.apiKey = wsKey;
+      }
+
+      console.log(`[ws] Scenario ${scenarioId}: apiKey from POST=${!!scenario.apiKey}, wsKey=${!!wsKey}`);
+
+      if (!scenario.apiKey) {
+        wsSend(ws, "simulation_error", { message: "No API key. Please log in again." });
+        ws.close();
+        return;
+      }
+
       scenario.status = "running";
 
       // Listen for client messages (confirmation, etc.)
       ws.on("message", (data) => {
         try {
           const msg = JSON.parse(data.toString());
-          if (msg.action === "confirm" && active.confirmResolve) {
+          const session = activeSessions.get(scenarioId);
+          if (msg.action === "confirm" && session?.confirmResolve) {
             console.log(`[ws] Received confirmation from client`);
-            active.confirmResolve(true);
+            session.confirmResolve(true);
           }
         } catch {}
       });
@@ -1443,10 +1495,11 @@ httpServer.on("upgrade", (req, socket, head) => {
       // Clean up if client disconnects mid-simulation
       ws.on("close", () => {
         console.log(`[ws] Client disconnected for scenario ${scenarioId}`);
-        if (active.ws === ws) {
+        const session = activeSessions.get(scenarioId);
+        if (session && session.ws === ws) {
           // Cancel pending confirmation
-          if (active.confirmResolve) {
-            active.confirmResolve(false);
+          if (session.confirmResolve) {
+            session.confirmResolve(false);
           }
         }
       });
@@ -1456,12 +1509,13 @@ httpServer.on("upgrade", (req, socket, head) => {
           console.error("Simulation error:", err);
           scenario.status = "error";
           saveHistory();
-          wsSend(ws, "error", { message: String(err.message || err) });
+          wsSend(ws, "simulation_error", { message: String(err.message || err) });
         })
         .finally(() => {
-          try {
-            ws.close();
-          } catch {}
+          // Small delay so the error event reaches the client before close
+          setTimeout(() => {
+            try { ws.close(); } catch {}
+          }, 500);
         });
     });
   } else {

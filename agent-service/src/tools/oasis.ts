@@ -13,7 +13,7 @@ const VENV_PYTHON = join(import.meta.dirname, "..", "..", ".venv", "bin", "pytho
 // Run OASIS Simulation
 // ---------------------------------------------------------------------------
 
-export function createRunOasisTool(defaultWorkDir: string): AgentTool {
+export function createRunOasisTool(defaultWorkDir: string, opts?: { apiKey?: string }): AgentTool {
   return {
     name: "run_oasis_simulation",
     label: "Run OASIS Simulation",
@@ -84,7 +84,16 @@ export function createRunOasisTool(defaultWorkDir: string): AgentTool {
       ];
 
       return new Promise<AgentToolResult<void>>((resolve) => {
-        const child = spawn(VENV_PYTHON, args, { cwd: workDir });
+        const child = spawn(VENV_PYTHON, args, {
+          cwd: workDir,
+          env: {
+            ...process.env,
+            ...(opts?.apiKey ? {
+              OPENAI_API_KEY: opts.apiKey,
+              OPENROUTER_API_KEY: opts.apiKey,
+            } : {}),
+          },
+        });
         const stderrChunks: string[] = [];
         const summaryLines: string[] = [];
 
