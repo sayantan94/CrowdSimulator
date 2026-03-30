@@ -35,7 +35,7 @@ function setCache(key: string, value: string) {
 // Tool: Perplexity Sonar via OpenRouter (from openclaw pattern)
 // ---------------------------------------------------------------------------
 
-export function createWebSearchTool(): AgentTool {
+export function createWebSearchTool(opts?: { searchModel?: string; apiKey?: string }): AgentTool {
   return {
     name: "web_search",
     label: "Web Search",
@@ -53,7 +53,7 @@ export function createWebSearchTool(): AgentTool {
       const cached = getCached(cacheKey);
       if (cached) return textResult(cached + "\n\n(cached)");
 
-      const apiKey = process.env.OPENROUTER_API_KEY;
+      const apiKey = opts?.apiKey || process.env.OPENROUTER_API_KEY;
       if (!apiKey) {
         return textResult(
           "web_search error: OPENROUTER_API_KEY not set. Cannot perform web search."
@@ -79,7 +79,7 @@ export function createWebSearchTool(): AgentTool {
               "X-Title": "CrowdSimulator Web Search",
             },
             body: JSON.stringify({
-              model: process.env.CS_SEARCH_MODEL || "perplexity/sonar",
+              model: opts?.searchModel || "perplexity/sonar",
               messages: [{ role: "user", content: query }],
             }),
             signal: controller.signal,

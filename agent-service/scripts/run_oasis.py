@@ -30,13 +30,18 @@ def get_model():
     from camel.types import ModelPlatformType
 
     provider = os.environ.get("CS_LLM_PROVIDER", "openrouter")
-    model_id = os.environ.get("CS_LLM_MODEL", "anthropic/claude-sonnet-4")
+    model_id = os.environ.get("CS_LLM_MODEL")
+    if not model_id:
+        raise RuntimeError("No model specified. Set CS_LLM_MODEL env var.")
 
     if provider == "openrouter":
+        api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY") or os.environ.get("CS_OPENROUTER_API_KEY")
+        if not api_key:
+            raise RuntimeError("No API key found. Set OPENROUTER_API_KEY or OPENAI_API_KEY env var.")
         return ModelFactory.create(
             model_platform=ModelPlatformType.OPENAI_COMPATIBLE_MODEL,
             model_type=model_id,
-            api_key=os.environ.get("OPENROUTER_API_KEY", os.environ.get("CS_OPENROUTER_API_KEY", "")),
+            api_key=api_key,
             url=os.environ.get("CS_OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
         )
     elif provider == "bedrock":
@@ -150,6 +155,49 @@ async def run_simulation(profiles_path: str, platform: str, rounds: int, db_path
     last_rowid = 0
     id_to_name = {i: p.get("name", f"Agent {i}") for i, p in enumerate(profiles)}
     id_to_archetype = {i: p.get("archetype", "neutral") for i, p in enumerate(profiles)}
+    # Map OASIS 0-indexed user_id back to the profile's agent_id (may be 1-indexed)
+    id_to_agent_id = {i: p.get("agent_id", i) for i, p in enumerate(profiles)}
+
+    def flush_trace(round_num):
+        """Read new rows from trace table and emit them. Returns new last_rowid."""
+        nonlocal last_rowid
+        try:
+            conn = sqlite3.connect(db_path, timeout=2)
+            cursor = conn.execute(
+                "SELECT rowid, user_id, created_at, action, info "
+                "FROM trace WHERE rowid > ? ORDER BY rowid",
+                (last_rowid,),
+            )
+            for row in cursor:
+                rowid, user_id, created_at, action, info = row
+                last_rowid = rowid
+                try:
+                    info_data = json.loads(info) if info else {}
+                except json.JSONDecodeError:
+                    info_data = {"raw": info}
+
+                emit({
+                    "type": "action",
+                    "round": round_num,
+                    "agent_id": id_to_agent_id.get(user_id, user_id),
+                    "agent_name": id_to_name.get(user_id, f"Agent {user_id}"),
+                    "archetype": id_to_archetype.get(user_id, "neutral"),
+                    "platform": platform,
+                    "action_type": (action or "").upper(),
+                    "content": info_data.get("content", info_data.get("raw", "")),
+                    "stats": {},
+                })
+            conn.close()
+        except Exception:
+            pass  # DB may be briefly locked by OASIS, retry next poll
+
+    async def poll_trace(round_num, stop_event):
+        """Poll trace table every 2s while env.step() is running."""
+        while not stop_event.is_set():
+            await asyncio.sleep(2)
+            if stop_event.is_set():
+                break
+            flush_trace(round_num)
 
     try:
         for r in range(rounds):
@@ -166,41 +214,20 @@ async def run_simulation(profiles_path: str, platform: str, rounds: int, db_path
                 }
                 await env.step(actions)
 
+            # Start polling trace table in background while agents run
+            stop_poll = asyncio.Event()
+            poll_task = asyncio.create_task(poll_trace(r + 1, stop_poll))
+
             # All agents take LLM-driven actions (following MiroFish main loop)
             agent_actions = {}
             for _, agent in agent_graph.get_agents():
                 agent_actions[agent] = oasis.LLMAction()
             await env.step(agent_actions)
 
-            # Read new actions from trace table and emit
-            conn = sqlite3.connect(db_path)
-            try:
-                cursor = conn.execute(
-                    "SELECT rowid, user_id, created_at, action, info "
-                    "FROM trace WHERE rowid > ? ORDER BY rowid",
-                    (last_rowid,),
-                )
-                for row in cursor:
-                    rowid, user_id, created_at, action, info = row
-                    last_rowid = rowid
-                    try:
-                        info_data = json.loads(info) if info else {}
-                    except json.JSONDecodeError:
-                        info_data = {"raw": info}
-
-                    emit({
-                        "type": "action",
-                        "round": r + 1,
-                        "agent_id": user_id,
-                        "agent_name": id_to_name.get(user_id, f"Agent {user_id}"),
-                        "archetype": id_to_archetype.get(user_id, "neutral"),
-                        "platform": platform,
-                        "action_type": (action or "").upper(),
-                        "content": info_data.get("content", info_data.get("raw", "")),
-                        "stats": {},
-                    })
-            finally:
-                conn.close()
+            # Stop polling and do a final sweep to catch any remaining rows
+            stop_poll.set()
+            await poll_task
+            flush_trace(r + 1)
 
     finally:
         await env.close()

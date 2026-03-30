@@ -131,8 +131,8 @@ const archColor = (arch) => {
 }
 
 // Action type categorization
-const positiveActions = new Set(['LIKE', 'LIKE_POST', 'LIKE_COMMENT', 'REPOST', 'SUPPORT', 'SHARE'])
-const negativeActions = new Set(['DISLIKE', 'REPORT', 'BLOCK', 'TROLL', 'ATTACK'])
+const positiveActions = new Set(['LIKE', 'LIKE_POST', 'LIKE_COMMENT', 'REPOST', 'SUPPORT', 'SHARE', 'FOLLOW'])
+const negativeActions = new Set(['DISLIKE', 'DISLIKE_POST', 'DISLIKE_COMMENT', 'DOWNVOTE_POST', 'UNLIKE_POST', 'REPORT', 'BLOCK', 'TROLL', 'ATTACK'])
 
 const actionSentiment = (type) => {
   if (positiveActions.has(type)) return 'pos'
@@ -209,7 +209,9 @@ const edges = computed(() => {
   }
   for (const roundActions of Object.values(byRound)) {
     const interacting = roundActions.filter(a =>
-      ['CREATE_COMMENT', 'COMMENT', 'LIKE_COMMENT', 'LIKE_POST', 'REPOST', 'LIKE', 'DISLIKE', 'REPORT', 'SHARE', 'SUPPORT', 'TROLL', 'ATTACK'].includes(a.action_type)
+      ['CREATE_COMMENT', 'COMMENT', 'LIKE_COMMENT', 'LIKE_POST', 'UNLIKE_POST',
+       'REPOST', 'LIKE', 'DISLIKE', 'DISLIKE_POST', 'DISLIKE_COMMENT', 'DOWNVOTE_POST',
+       'REPORT', 'SHARE', 'SUPPORT', 'TROLL', 'ATTACK', 'FOLLOW'].includes(a.action_type)
     )
     for (let i = 0; i < interacting.length; i++) {
       for (let j = i + 1; j < interacting.length; j++) {
@@ -375,8 +377,17 @@ function updateHighlight(activeId) {
     })
 }
 
-function renderGraph() {
+function renderGraph(preserveLayout = false) {
   if (!svgRef.value || !containerRef.value || props.agents.length === 0) return
+
+  // Save existing node positions before rebuild
+  const posMap = new Map()
+  if (preserveLayout) {
+    for (const n of currentNodes) {
+      if (n.x != null) posMap.set(n.id, { x: n.x, y: n.y, vx: n.vx || 0, vy: n.vy || 0 })
+    }
+  }
+
   if (simulation) simulation.stop()
 
   const container = containerRef.value
@@ -426,6 +437,15 @@ function renderGraph() {
       const ap = archPos[d.archetype]
       return ap ? height / 2 + Math.sin(ap.angle) * clusterRadius : height / 2
     }).strength(0.04))
+
+  // Restore saved positions so nodes don't fly around on data updates
+  if (preserveLayout && posMap.size > 0) {
+    for (const node of currentNodes) {
+      const p = posMap.get(node.id)
+      if (p) { node.x = p.x; node.y = p.y; node.vx = p.vx; node.vy = p.vy; node.fx = undefined; node.fy = undefined }
+    }
+    simulation.alpha(0.12) // gentle settle, not full layout
+  }
 
   // SVG Defs
   const defs = svg.append('defs')
@@ -656,10 +676,15 @@ function renderGraph() {
 }
 
 let renderTimer = null
-watch(() => [props.agents.length, props.actions.length], () => {
+let prevAgentCount = 0
+watch(() => [props.agents.length, props.actions.length], ([agentLen]) => {
   if (renderTimer) clearTimeout(renderTimer)
-  renderTimer = setTimeout(() => nextTick(renderGraph), 500)
-}, { deep: true })
+  const agentsChanged = agentLen !== prevAgentCount
+  prevAgentCount = agentLen
+  // Full layout when agents change; preserve positions when only actions stream in
+  const delay = agentsChanged ? 100 : 150
+  renderTimer = setTimeout(() => nextTick(() => renderGraph(!agentsChanged)), delay)
+})
 
 onMounted(() => {
   checkTheme()

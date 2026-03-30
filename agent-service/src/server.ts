@@ -17,11 +17,20 @@ import {
   createRunOasisTool,
   createReadResultsTool,
 } from "./tools/index.js";
+import { loadGstackPersonas, type GstackPersona } from "./gstack.js";
 
 
 interface Variant {
   id: string;   // "A", "B", "C"
   text: string;
+}
+
+interface GstackPersonaSelection {
+  skill_name: string;
+  count: number;                    // 1-10, how many variants to spawn
+  sentiment_bias?: number;          // override, -1.0 to 1.0
+  influence_weight?: number;        // override, 0.5 to 5.0
+  activity_level?: number;          // override, 0.1 to 1.0
 }
 
 interface Scenario {
@@ -33,8 +42,12 @@ interface Scenario {
   agent_count: number;
   rounds: number;
   model?: string;
+  search_model?: string;
+  mode?: "normal" | "gstack";
+  gstack_personas?: GstackPersonaSelection[];  // was string[]
   status: string;
   research_topics: string[];  // user-specified research angles
+  apiKey?: string;            // per-user OpenRouter API key (never persisted)
 }
 
 interface SimulationResults {
@@ -65,6 +78,10 @@ interface ActiveSession {
   collectedAgents: Array<Record<string, any>>;
   collectedActions: Array<Record<string, any>>;
   collectedSources: Array<{ query: string; url?: string; tool: string }>;
+  aborted: boolean;
+  childProcesses: Set<import("node:child_process").ChildProcess>;
+  disconnectTimer: ReturnType<typeof setTimeout> | null;
+  replayableEvents: Array<Record<string, any>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -72,6 +89,7 @@ interface ActiveSession {
 // ---------------------------------------------------------------------------
 
 const DATA_DIR = join(process.cwd(), "data");
+const BOOT_ID = randomUUID().slice(0, 8);
 const CROWDSIM_HOME = join(homedir(), ".crowdsim");
 const HISTORY_FILE = join(CROWDSIM_HOME, "history.json");
 
@@ -100,7 +118,7 @@ async function saveHistory() {
   try {
     mkdirSync(CROWDSIM_HOME, { recursive: true });
     const data = {
-      scenarios: [...scenarios.values()],
+      scenarios: [...scenarios.values()].map(({ apiKey: _, ...s }) => s),
       results: Object.fromEntries(results),
     };
     await writeFile(HISTORY_FILE, JSON.stringify(data, null, 2));
@@ -112,13 +130,95 @@ async function saveHistory() {
 loadHistory();
 
 // ---------------------------------------------------------------------------
-// Persistent agent — survives across simulation runs, builds memory
+// Load gstack personas (if directory exists)
 // ---------------------------------------------------------------------------
 
-let persistentAgent: Agent | null = null;
-let agentBusy = false;
+const DEFAULT_GSTACK_DIR = process.env.GSTACK_DIR || join(homedir(), "Documents/Workspace/personal-assist/gstack");
+let currentGstackDir = DEFAULT_GSTACK_DIR;
+let gstackPersonas: GstackPersona[] = [];
+try {
+  gstackPersonas = loadGstackPersonas(currentGstackDir);
+  console.log(`[gstack] ${gstackPersonas.length} personas available`);
+} catch (err) {
+  console.warn("[gstack] Failed to load personas:", err);
+}
 
-const active: ActiveSession = { ws: null, phase: "idle", pipelinePhase: 0, finalContent: "", lastAgentError: "", toolStarts: new Map(), confirmResolve: null, profilesSent: false, collectedAgents: [], collectedActions: [], collectedSources: [] };
+// ---------------------------------------------------------------------------
+// Per-simulation active session — each simulation creates its own
+// ---------------------------------------------------------------------------
+
+// Track active sessions by scenario ID so the WS handler can find them
+const activeSessions = new Map<string, ActiveSession>();
+
+function createActiveSession(): ActiveSession {
+  return { ws: null, phase: "idle", pipelinePhase: 0, finalContent: "", lastAgentError: "", toolStarts: new Map(), confirmResolve: null, profilesSent: false, collectedAgents: [], collectedActions: [], collectedSources: [], aborted: false, childProcesses: new Set(), disconnectTimer: null, replayableEvents: [] };
+}
+
+function abortSession(scenarioId: string) {
+  const session = activeSessions.get(scenarioId);
+  if (!session) return;
+  console.log(`[ws] Aborting session ${scenarioId} (${session.childProcesses.size} child processes)`);
+  session.aborted = true;
+  // Kill any running OASIS subprocesses
+  for (const child of session.childProcesses) {
+    try { child.kill("SIGTERM"); } catch {}
+  }
+  session.childProcesses.clear();
+  // Cancel pending confirmation
+  if (session.confirmResolve) {
+    session.confirmResolve(false);
+    session.confirmResolve = null;
+  }
+  if (session.disconnectTimer) {
+    clearTimeout(session.disconnectTimer);
+    session.disconnectTimer = null;
+  }
+  activeSessions.delete(scenarioId);
+}
+
+/** Record an event for replay and send it directly (no recursion into wsSend). */
+function wsSendAndRecord(session: ActiveSession, scenarioId: string, eventType: string, data: Record<string, any>) {
+  const entry = { event: eventType, ...data, _ts: Date.now() };
+  session.replayableEvents.push(entry);
+  // Append to disk (fire-and-forget)
+  const dir = join(DATA_DIR, scenarioId);
+  mkdirSync(dir, { recursive: true });
+  const eventsPath = join(dir, "events.jsonl");
+  writeFile(eventsPath, JSON.stringify(entry) + "\n", { flag: "a" }).catch(() => {});
+  // Send directly to WS
+  try {
+    const ws = session.ws;
+    if (ws && ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ event: eventType, ...data }));
+    }
+  } catch {}
+}
+
+/** Replay events to a newly connected WebSocket. Reads from memory first, falls back to disk. */
+function replayState(ws: WebSocket, session: ActiveSession, scenario: Scenario) {
+  let events = session.replayableEvents;
+
+  // If in-memory is empty (e.g. server restarted), try loading from disk
+  if (events.length === 0) {
+    const eventsPath = join(DATA_DIR, scenario.id, "events.jsonl");
+    try {
+      if (existsSync(eventsPath)) {
+        const lines = readFileSync(eventsPath, "utf-8").trim().split("\n").filter(Boolean);
+        events = lines.map(line => JSON.parse(line));
+        session.replayableEvents = events;
+      }
+    } catch (err) {
+      console.warn(`[ws] Failed to load events from disk for ${scenario.id}:`, err);
+    }
+  }
+
+  for (const entry of events) {
+    const { event, _ts, ...data } = entry;
+    wsSend(ws, event, data);
+  }
+
+  console.log(`[ws] Replayed ${events.length} events to reconnected client: phase=${session.phase}, agents=${session.collectedAgents.length}`);
+}
 
 const SYSTEM_PROMPT = `You are CrowdSimulator, an AI agent that predicts how audiences will react to social media posts before they are published.
 
@@ -222,13 +322,12 @@ IMPORTANT: Your very last message must be ONLY this JSON object.`;
 // Model resolution
 // ---------------------------------------------------------------------------
 
-function resolveModel(provider: string, modelId?: string): Model<any> {
+function resolveModel(provider: string, modelId: string): Model<any> {
   if (provider === "openrouter") {
-    const id = modelId || "anthropic/claude-sonnet-4";
-    return getModel("openrouter", id as any);
+    return getModel("openrouter", modelId as any);
+  } else {
+    return getModel("amazon-bedrock", modelId as any);
   }
-  const id = modelId || "anthropic.claude-sonnet-4-20250514-v1:0";
-  return getModel("amazon-bedrock", id as any);
 }
 
 function convertToLlm(messages: any[]): Message[] {
@@ -360,21 +459,19 @@ async function transformContext(messages: any[]): Promise<any[]> {
 }
 
 // ---------------------------------------------------------------------------
-// Agent event handler — uses mutable `active` session state
+// Agent event handler — uses the passed-in `active` session state
 // ---------------------------------------------------------------------------
 
-function handleAgentEvent(event: AgentEvent) {
-  const ws = active.ws;
-  const wsOpen = ws && ws.readyState === ws.OPEN;
+function handleAgentEvent(event: AgentEvent, active: ActiveSession, scenarioId: string) {
+  const send = (eventType: string, data: Record<string, any>) =>
+    sessionSend(active, scenarioId, eventType, data);
 
   // Always process agent_end to capture final content, even if WS is closed
   if (event.type === "agent_end") {
     // Only send strategizing phase for pipeline phase 2
     if (active.pipelinePhase === 2) {
       active.phase = "strategizing";
-      if (wsOpen) {
-        wsSend(ws!, "phase", { phase: "strategizing", message: "Finalizing strategy..." });
-      }
+      send("phase", { phase: "strategizing", message: "Finalizing strategy..." });
     }
 
     const allTexts: string[] = [];
@@ -407,11 +504,10 @@ function handleAgentEvent(event: AgentEvent) {
     return;
   }
 
-  if (!wsOpen) return;
-
+  // Record events even when WS is disconnected — they'll be replayed on reconnect
   switch (event.type) {
     case "agent_start":
-      wsSend(ws, "phase", {
+      send("phase", {
         phase: "researching",
         message: "Agent is researching context...",
       });
@@ -475,19 +571,19 @@ function handleAgentEvent(event: AgentEvent) {
               activity_level: p.activity_level || "medium",
             };
             active.collectedAgents.push(agentData);
-            wsSend(ws, "agent_generated", agentData);
+            send("agent_generated", agentData);
           }
         }
 
         active.phase = "simulating";
-        wsSend(ws, "phase", {
+        send("phase", {
           phase: "simulating",
           message: `Running ${args.platform || ""} simulation...`,
         });
       } else if (tool === "read_simulation_results") {
         toolEvent.label = "Reading simulation results...";
         active.phase = "analyzing";
-        wsSend(ws, "phase", {
+        send("phase", {
           phase: "analyzing",
           message: "Analyzing simulation data...",
         });
@@ -495,7 +591,7 @@ function handleAgentEvent(event: AgentEvent) {
         toolEvent.label = tool;
       }
 
-      wsSend(ws, "research_event", toolEvent);
+      send("research_event", toolEvent);
       console.log(`[tool_start] ${tool}: ${toolEvent.label}`);
       break;
     }
@@ -553,11 +649,11 @@ function handleAgentEvent(event: AgentEvent) {
         toolEndEvent.result_content = resultFull;
       }
 
-      wsSend(ws, "research_event", toolEndEvent);
+      send("research_event", toolEndEvent);
 
       if (tool === "read_simulation_results") {
         active.phase = "strategizing";
-        wsSend(ws, "phase", {
+        send("phase", {
           phase: "strategizing",
           message: "Generating analysis and strategy...",
         });
@@ -577,10 +673,10 @@ function handleAgentEvent(event: AgentEvent) {
         if (details.type === "action") {
           console.log(`[sim_action] platform=${details.platform} agent=${details.agent_name} action=${details.action_type}`);
           active.collectedActions.push(details);
-          wsSend(ws, "simulation_action", details);
+          send("simulation_action", details);
         } else if (details.type === "progress") {
           console.log(`[sim_progress] platform=${details.platform} ${details.message}`);
-          wsSend(ws, "simulation_progress", {
+          send("simulation_progress", {
             platform: details.platform || "",
             message: details.message || "",
           });
@@ -595,7 +691,7 @@ function handleAgentEvent(event: AgentEvent) {
       const evt = event.assistantMessageEvent as any;
       if (evt.type === "text" && evt.text?.trim()) {
         // Stream text deltas for all phases
-        wsSend(ws, "research_event", {
+        send("research_event", {
           event_type: "text_delta",
           text: evt.text,
           phase: active.phase,
@@ -612,7 +708,7 @@ function handleAgentEvent(event: AgentEvent) {
           .join("");
         if (text && active.phase === "researching") {
           if (text.includes("## ") || text.includes("**")) {
-            wsSend(ws, "research_event", {
+            send("research_event", {
               event_type: "message_end",
               text: text.slice(0, 300),
             });
@@ -627,27 +723,24 @@ function handleAgentEvent(event: AgentEvent) {
 }
 
 // ---------------------------------------------------------------------------
-// Get or create persistent agent
+// Create a fresh agent per simulation (per-user API key)
 // ---------------------------------------------------------------------------
 
-function getOrCreateAgent(): Agent {
-  if (persistentAgent) return persistentAgent;
-
+function createAgentForSimulation(active: ActiveSession, scenarioId: string, apiKey?: string, userModel: string = "", searchModel?: string): Agent {
   const provider = process.env.CS_LLM_PROVIDER || "openrouter";
-  const modelId = process.env.CS_LLM_MODEL;
-  const model = resolveModel(provider, modelId);
+  const model = resolveModel(provider, userModel);
 
   mkdirSync(DATA_DIR, { recursive: true });
 
   const tools = [
-    createWebSearchTool(),
+    createWebSearchTool({ searchModel, apiKey }),
     createFetchTool(),
     createShellTool(DATA_DIR),
-    createRunOasisTool(DATA_DIR),
+    createRunOasisTool(DATA_DIR, { apiKey, modelId: userModel }),
     createReadResultsTool(DATA_DIR),
   ];
 
-  persistentAgent = new Agent({
+  const agent = new Agent({
     initialState: {
       systemPrompt: SYSTEM_PROMPT,
       model,
@@ -656,13 +749,14 @@ function getOrCreateAgent(): Agent {
     },
     convertToLlm,
     transformContext,
+    getApiKey: () => apiKey || process.env.OPENROUTER_API_KEY || "",
   });
 
-  // Single subscription — uses mutable `active` session state
-  persistentAgent.subscribe(handleAgentEvent);
+  // Subscribe with the session-scoped `active` state
+  agent.subscribe((event) => handleAgentEvent(event, active, scenarioId));
 
-  console.log(`Agent created with provider=${provider} model=${modelId || "(default)"}`);
-  return persistentAgent;
+  console.log(`Agent created with provider=${provider} model=${userModel} apiKey=${apiKey ? "user-provided" : "env"}`);
+  return agent;
 }
 
 // ---------------------------------------------------------------------------
@@ -733,13 +827,18 @@ const SCRIPTS_DIR = join(import.meta.dirname, "..", "scripts");
 const VENV_PYTHON = join(import.meta.dirname, "..", ".venv", "bin", "python3");
 
 async function runOasisDirect(
-  ws: WebSocket,
+  active: ActiveSession,
+  scenarioId: string,
   platform: string,
   profiles: any[],
   rounds: number,
   postText: string,
   workDir: string,
+  apiKey?: string,
+  modelId?: string,
 ): Promise<void> {
+  const send = (eventType: string, data: Record<string, any>) =>
+    sessionSend(active, scenarioId, eventType, data);
   const profilesPath = join(workDir, `profiles_${platform}.json`);
   await writeFile(profilesPath, JSON.stringify(profiles, null, 2));
   const dbPath = join(workDir, `${platform}.db`);
@@ -755,11 +854,11 @@ async function runOasisDirect(
 
   console.log(`[oasis-direct] Starting ${platform} simulation: ${profiles.length} agents, ${rounds} rounds`);
 
-  wsSend(ws, "phase", {
+  send("phase", {
     phase: "simulating",
     message: `Running ${platform} simulation...`,
   });
-  wsSend(ws, "research_event", {
+  send("research_event", {
     event_type: "tool_start",
     tool_name: "run_oasis_simulation",
     tool_call_id: `oasis-${platform}`,
@@ -769,7 +868,21 @@ async function runOasisDirect(
   });
 
   return new Promise<void>((resolve, reject) => {
-    const child = spawn(VENV_PYTHON, args, { cwd: workDir });
+    const effectiveKey = apiKey || process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY || "";
+    const child = spawn(VENV_PYTHON, args, {
+      cwd: workDir,
+      env: {
+        ...process.env,
+        ...(effectiveKey ? {
+          OPENAI_API_KEY: effectiveKey,
+          OPENROUTER_API_KEY: effectiveKey,
+          OPENAI_BASE_URL: "https://openrouter.ai/api/v1",
+        } : {}),
+        ...(modelId ? { CS_LLM_MODEL: modelId } : {}),
+      },
+    });
+    // Track child process for abort cleanup
+    active.childProcesses.add(child);
     const stderrChunks: string[] = [];
 
     const rl = createInterface({ input: child.stdout });
@@ -779,10 +892,10 @@ async function runOasisDirect(
         if (event.type === "action") {
           console.log(`[sim_action] platform=${event.platform} agent=${event.agent_name} action=${event.action_type}`);
           active.collectedActions.push(event);
-          wsSend(ws, "simulation_action", event);
+          send("simulation_action", event);
         } else if (event.type === "progress") {
           console.log(`[sim_progress] platform=${event.platform} ${event.message}`);
-          wsSend(ws, "simulation_progress", {
+          send("simulation_progress", {
             platform: event.platform || platform,
             message: event.message || "",
           });
@@ -805,7 +918,8 @@ async function runOasisDirect(
 
     child.on("close", (code) => {
       clearTimeout(timer);
-      wsSend(ws, "research_event", {
+      active.childProcesses.delete(child);
+      send("research_event", {
         event_type: "tool_end",
         tool_name: "run_oasis_simulation",
         tool_call_id: `oasis-${platform}`,
@@ -826,24 +940,133 @@ async function runOasisDirect(
 }
 
 // ---------------------------------------------------------------------------
+// gstack Phase 1 prompt builder
+// ---------------------------------------------------------------------------
+
+function buildGstackPhase1Prompt(scenario: Scenario, workDir: string): string {
+  const selections = scenario.gstack_personas || [];
+  if (selections.length === 0) {
+    throw new Error("No gstack personas selected. Pick at least one team member.");
+  }
+
+  // Match selections to loaded personas, apply overrides
+  const enriched = selections.map(sel => {
+    const base = gstackPersonas.find(p => p.skill_name === sel.skill_name);
+    if (!base) return null;
+    return {
+      ...base,
+      count: sel.count || 1,
+      sentiment_bias: sel.sentiment_bias ?? base.sentiment_bias,
+      influence_weight: sel.influence_weight ?? base.influence_weight,
+      activity_level: sel.activity_level ?? base.activity_level,
+    };
+  }).filter(Boolean) as (GstackPersona & { count: number })[];
+
+  if (enriched.length === 0) {
+    throw new Error("No matching gstack personas found for the selected skill names.");
+  }
+
+  const totalAgents = enriched.reduce((sum, p) => sum + p.count, 0);
+
+  const personaDescriptions = enriched.map((p, i) => `
+### Persona ${i}: ${p.display_name} (${p.skill_name}) — GENERATE ${p.count} VARIANT${p.count > 1 ? "S" : ""}
+**Role:** ${p.profession}
+**Archetype:** ${p.archetype}
+**sentiment_bias:** ${p.sentiment_bias}${p.count > 1 ? ` (jitter each variant ±0.15, stay within -1.0 to 1.0)` : ""}
+**influence_weight:** ${p.influence_weight}${p.count > 1 ? ` (jitter each variant ±0.3, stay within 0.5 to 5.0)` : ""}
+**activity_level:** ${p.activity_level}${p.count > 1 ? ` (jitter each variant ±0.1, stay within 0.1 to 1.0)` : ""}
+**Interested topics:** ${p.interested_topics.join(", ")}
+**Expertise:** ${p.description}
+`).join("\n---\n");
+
+  const isAB = scenario.variants.length > 1;
+  const postTextSection = isAB
+    ? scenario.variants.map(v => `VARIANT ${v.id}: "${v.text}"`).join("\n\n")
+    : `POST TEXT: "${scenario.post_text}"`;
+
+  return `Run a crowd simulation for this scenario using PRE-DEFINED TEAM PERSONAS.
+
+SCENARIO ID: ${scenario.id}
+
+${postTextSection}
+
+AUDIENCE DESCRIPTION: "${scenario.audience_desc || "expert tech team"}"
+
+PLATFORMS: ${scenario.platforms.join(" and ")}
+NUMBER OF AGENTS: ${totalAgents}
+SIMULATION ROUNDS: ${scenario.rounds || 5}
+WORK DIRECTORY: ${workDir}
+${isAB ? `\nA/B TEST MODE: Testing ${scenario.variants.length} variants. Research covers ALL variants. Same team reacts to each.\n` : ""}
+
+MODE: GSTACK TEAM SIMULATION
+You are simulating how a team of expert specialists would react to this post.
+These are not random internet users — they are opinionated professionals with specific expertise.
+
+STEP 1 — RESEARCH THE TOPIC:
+Conduct AT LEAST 10-15 web_search queries to understand the topic context:
+- Current discourse and opinions on this topic (3-4 searches)
+- Recent news and events (2-3 searches)
+- Technical context relevant to the team roles (2-3 searches)
+- Controversy, risks, or counterarguments (2-3 searches)
+${scenario.research_topics.length > 0 ? `\nUSER-SPECIFIED RESEARCH TOPICS (MUST research):\n${scenario.research_topics.map(t => `- ${t}`).join("\n")}\n` : ""}
+
+After research, output a structured research summary in a \`\`\`research_summary code fence.
+
+STEP 2 — ENRICH AND MULTIPLY THESE PRE-DEFINED PERSONAS WITH YOUR RESEARCH:
+Below are ${enriched.length} team personas. Some request MULTIPLE VARIANTS — you must generate the exact number specified.
+
+For personas requesting multiple variants (count > 1):
+- Each variant is a DISTINCT INDIVIDUAL within that role. Different name, age, gender, MBTI, backstory.
+- Slightly jitter their numeric traits as noted (sentiment_bias, influence_weight, activity_level).
+- Each variant should have a different perspective on the topic — e.g., 3 security people might focus on different risks (PCI compliance vs supply chain vs insider threats).
+- Each variant gets a unique \`agent_id\` (use format: "agent_<persona-index>_<variant-index>", e.g., "agent_0_0", "agent_0_1", "agent_0_2").
+
+For personas requesting a single variant (count = 1):
+- Generate one profile as before.
+- Use their traits EXACTLY as specified (no jitter).
+
+For EVERY profile:
+1. Keep their archetype EXACTLY as defined
+2. Write a \`persona\` field (2000+ chars) describing how THIS SPECIFIC PERSON would view THIS SPECIFIC TOPIC based on your research. Reference real findings. Write in first person.
+3. Write a \`research_basis\` explaining which research findings shaped their likely reaction
+4. Generate realistic \`name\`, \`username\`, \`bio\`, \`age\`, \`gender\`, \`mbti\`
+
+Output ALL ${totalAgents} enriched profiles as a single JSON array in a \`\`\`json code fence.
+Each profile must include ALL fields: agent_id, username, name, bio, persona, age, gender, mbti, profession, interested_topics, sentiment_bias, influence_weight, activity_level, archetype, research_basis.
+
+PRE-DEFINED PERSONAS:
+${personaDescriptions}
+
+DO NOT call run_oasis_simulation yet — the user needs to review and confirm the profiles first.`;
+}
+
+// ---------------------------------------------------------------------------
 // Simulation runner (two-phase pipeline with confirmation gate)
 // ---------------------------------------------------------------------------
 
-async function runSimulation(ws: WebSocket, scenario: Scenario) {
-  if (agentBusy) {
-    throw new Error("Agent is busy with another simulation. Please wait and try again.");
-  }
-
-  agentBusy = true;
-  active.ws = ws;
+async function runSimulation(initialWs: WebSocket, scenario: Scenario) {
+  // Each simulation gets its own session state and agent
+  const active = createActiveSession();
+  activeSessions.set(scenario.id, active);
+  active.ws = initialWs;
   active.phase = "researching";
   active.pipelinePhase = 1;
   active.finalContent = "";
   active.profilesSent = false;
   active.confirmResolve = null;
 
+  // Helper: send events via the session's current WS (survives reconnects) and record for replay
+  const send = (eventType: string, data: Record<string, any>) =>
+    sessionSend(active, scenario.id, eventType, data);
+
+  const userApiKey = scenario.apiKey;
+  if (!userApiKey) {
+    throw new Error("No API key available. Please log in with your OpenRouter key.");
+  }
+  console.log(`[sim] API key: user-provided, prefix: ${userApiKey.slice(0, 12)}...`);
+
   try {
-    const agent = getOrCreateAgent();
+    const agent = createAgentForSimulation(active, scenario.id, userApiKey, scenario.model, scenario.search_model);
 
     const workDir = join(DATA_DIR, scenario.id);
     mkdirSync(workDir, { recursive: true });
@@ -851,8 +1074,8 @@ async function runSimulation(ws: WebSocket, scenario: Scenario) {
     const platforms = scenario.platforms.join(" and ");
     const isAB = scenario.variants.length > 1;
 
-    const modelId = process.env.CS_LLM_MODEL || "anthropic/claude-sonnet-4";
-    const searchModel = process.env.CS_SEARCH_MODEL || "perplexity/sonar";
+    const modelId = scenario.model;
+    const searchModel = scenario.search_model;
 
     console.log(`[sim] Starting simulation for scenario ${scenario.id}`);
     console.log(`[sim] Model: ${modelId}, Search: ${searchModel}`);
@@ -860,9 +1083,7 @@ async function runSimulation(ws: WebSocket, scenario: Scenario) {
     console.log(`[sim] Platforms: ${platforms}, Agents: ${scenario.agent_count}, Rounds: ${scenario.rounds}`);
 
     // Send config info to frontend
-    if (ws.readyState === ws.OPEN) {
-      wsSend(ws, "config", { model: modelId, search_model: searchModel });
-    }
+    send("config", { model: modelId, search_model: searchModel });
 
     // Build post text section for Phase 1 — include ALL variants for research context
     const postTextSection = isAB
@@ -870,7 +1091,9 @@ async function runSimulation(ws: WebSocket, scenario: Scenario) {
       : `POST TEXT: "${scenario.post_text}"`;
 
     // ── Phase 1: Research + Generate Profiles ──────────────────────────
-    const phase1Prompt = `Run a crowd simulation for this scenario:
+    const phase1Prompt = scenario.mode === "gstack"
+      ? buildGstackPhase1Prompt(scenario, workDir)
+      : `Run a crowd simulation for this scenario:
 
 SCENARIO ID: ${scenario.id}
 
@@ -921,12 +1144,10 @@ DO NOT call run_oasis_simulation yet — the user needs to review and confirm th
         if (attempt < retries) {
           const delay = attempt * 3000; // 3s, 6s backoff
           console.log(`[retry] Waiting ${delay}ms before retry...`);
-          if (active.ws && active.ws.readyState === active.ws.OPEN) {
-            wsSend(active.ws, "phase", {
-              phase: active.phase,
-              message: `Provider error — retrying (${attempt}/${retries})...`,
-            });
-          }
+          send("phase", {
+            phase: active.phase,
+            message: `Provider error — retrying (${attempt}/${retries})...`,
+          });
           await new Promise((r) => setTimeout(r, delay));
         }
       }
@@ -935,6 +1156,7 @@ DO NOT call run_oasis_simulation yet — the user needs to review and confirm th
     }
 
     await promptWithRetry(agent, phase1Prompt);
+    if (active.aborted) { console.log(`[sim] Aborted after Phase 1 research`); return; }
 
     const agentState = agent.state;
     if (agentState.error) throw new Error(`Agent error: ${agentState.error}`);
@@ -962,9 +1184,7 @@ DO NOT call run_oasis_simulation yet — the user needs to review and confirm th
         : `You did not output agent profiles. Generate ${scenario.agent_count || 15} agent profiles as a JSON array in a \`\`\`json code fence. Each profile must include: agent_id, username, name, bio, persona, age, gender, mbti, profession, interested_topics, sentiment_bias, influence_weight, activity_level, archetype, research_basis. Output ONLY the JSON array, no other text.`;
 
       console.log(`[sim] Profile extraction failed (attempt ${retry}/2, content=${active.finalContent.length} chars), retrying...`);
-      if (ws.readyState === ws.OPEN) {
-        wsSend(ws, "phase", { phase: "researching", message: `Retrying profile generation (${retry}/2)...` });
-      }
+      send("phase", { phase: "researching", message: `Retrying profile generation (${retry}/2)...` });
       active.finalContent = "";
       await promptWithRetry(agent, retryMsg);
       extraction = extractProfiles(active.finalContent);
@@ -977,7 +1197,6 @@ DO NOT call run_oasis_simulation yet — the user needs to review and confirm th
     const profiles = extraction.profiles;
 
     // Send full profile data to frontend and collect for results
-    const wsOpen = ws && ws.readyState === ws.OPEN;
     active.collectedAgents = [];
     for (const p of profiles) {
       const agentData = {
@@ -998,7 +1217,7 @@ DO NOT call run_oasis_simulation yet — the user needs to review and confirm th
         research_basis: p.research_basis || "",
       };
       active.collectedAgents.push(agentData);
-      if (wsOpen) wsSend(ws, "agent_generated", agentData);
+      send("agent_generated", agentData);
     }
 
     // Extract research summary from Phase 1 output
@@ -1006,23 +1225,21 @@ DO NOT call run_oasis_simulation yet — the user needs to review and confirm th
     const rsMat = active.finalContent.match(/```research_summary\s*\n([\s\S]*?)```/);
     if (rsMat) researchSummary = rsMat[1].trim();
 
-    if (wsOpen) {
-      active.profilesSent = true;
+    active.profilesSent = true;
+    send("agents_ready", {
+      count: profiles.length,
+      platforms: scenario.platforms,
+      rounds: scenario.rounds,
+      sources_count: active.collectedSources.length,
+      research_summary: researchSummary,
+      sources: active.collectedSources,
+    });
+    send("phase", {
+      phase: "awaiting_confirmation",
+      message: `${profiles.length} personas generated — review and confirm`,
+    });
 
-      wsSend(ws, "agents_ready", {
-        count: profiles.length,
-        platforms: scenario.platforms,
-        rounds: scenario.rounds,
-        sources_count: active.collectedSources.length,
-        research_summary: researchSummary,
-        sources: active.collectedSources,
-      });
-      wsSend(ws, "phase", {
-        phase: "awaiting_confirmation",
-        message: `${profiles.length} personas generated — review and confirm`,
-      });
-    }
-
+    if (active.aborted) { console.log(`[sim] Aborted before confirmation`); return; }
     active.phase = "awaiting_confirmation";
     console.log(`[sim] Sent ${profiles.length} profiles. Waiting for confirmation...`);
 
@@ -1058,16 +1275,14 @@ DO NOT call run_oasis_simulation yet — the user needs to review and confirm th
       active.finalContent = "";
       active.collectedActions = [];
 
-      if (ws.readyState === ws.OPEN) {
-        wsSend(ws, "phase", {
-          phase: "simulating",
-          message: isAB
-            ? `Running Variant ${variant.id} (${vi + 1}/${scenario.variants.length})...`
-            : "Starting simulation...",
-        });
-        if (isAB) {
-          wsSend(ws, "variant_start", { variant_id: variant.id, variant_index: vi, total_variants: scenario.variants.length, text: variant.text });
-        }
+      send("phase", {
+        phase: "simulating",
+        message: isAB
+          ? `Running Variant ${variant.id} (${vi + 1}/${scenario.variants.length})...`
+          : "Starting simulation...",
+      });
+      if (isAB) {
+        send("variant_start", { variant_id: variant.id, variant_index: vi, total_variants: scenario.variants.length, text: variant.text });
       }
 
       // ── Run OASIS deterministically for each platform ──────────────────
@@ -1075,11 +1290,12 @@ DO NOT call run_oasis_simulation yet — the user needs to review and confirm th
       const simRounds = scenario.rounds || 5;
 
       for (const plat of scenario.platforms) {
+        if (active.aborted) { console.log(`[sim] Aborted before ${plat} simulation`); return; }
         try {
-          await runOasisDirect(ws, plat, profiles, simRounds, postText, variantDir);
+          await runOasisDirect(active, scenario.id, plat, profiles, simRounds, postText, variantDir, scenario.apiKey, scenario.model);
         } catch (err: any) {
           console.error(`[sim] Platform ${plat} failed: ${err.message}`);
-          wsSend(ws, "simulation_error", {
+          send("simulation_error", {
             platform: plat,
             message: err.message,
           });
@@ -1093,7 +1309,7 @@ DO NOT call run_oasis_simulation yet — the user needs to review and confirm th
 
       // ── Ask LLM to read results and analyze ────────────────────────────
       active.phase = "analyzing";
-      wsSend(ws, "phase", {
+      send("phase", {
         phase: "analyzing",
         message: "Analyzing simulation data...",
       });
@@ -1252,8 +1468,8 @@ Your FINAL response must be ONLY a JSON object with these fields:
 
       variantResults[variant.id] = simResults;
 
-      if (ws.readyState === ws.OPEN && isAB) {
-        wsSend(ws, "variant_complete", { variant_id: variant.id, results: simResults });
+      if (isAB) {
+        send("variant_complete", { variant_id: variant.id, results: simResults });
       }
     }
 
@@ -1266,11 +1482,15 @@ Your FINAL response must be ONLY a JSON object with these fields:
     scenario.status = "complete";
     saveHistory();
 
-    wsSend(ws, "simulation_complete", {
+    send("simulation_complete", {
       results: isAB ? variantResults : variantResults[scenario.variants[0].id],
       is_ab: isAB,
     });
   } finally {
+    if (active.disconnectTimer) {
+      clearTimeout(active.disconnectTimer);
+      active.disconnectTimer = null;
+    }
     active.ws = null;
     active.phase = "idle";
     active.pipelinePhase = 0;
@@ -1280,7 +1500,7 @@ Your FINAL response must be ONLY a JSON object with these fields:
     active.collectedAgents = [];
     active.collectedActions = [];
     active.collectedSources = [];
-    agentBusy = false;
+    activeSessions.delete(scenario.id);
   }
 }
 
@@ -1288,12 +1508,24 @@ Your FINAL response must be ONLY a JSON object with these fields:
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-function jsonResponse(res: ServerResponse, status: number, data: any) {
+const ALLOWED_ORIGINS = new Set([
+  "https://crowdsim.agentdex.store",
+  "http://localhost:5173",
+  "http://localhost:3000",
+]);
+
+function getCorsOrigin(req: IncomingMessage): string {
+  const origin = req.headers.origin || "";
+  return ALLOWED_ORIGINS.has(origin) ? origin : "";
+}
+
+function jsonResponse(res: ServerResponse, status: number, data: any, req?: IncomingMessage) {
+  const origin = req ? getCorsOrigin(req) : "";
   res.writeHead(status, {
     "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
+    ...(origin ? { "Access-Control-Allow-Origin": origin } : {}),
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
   });
   res.end(JSON.stringify(data));
 }
@@ -1318,9 +1550,12 @@ function wsSend(ws: WebSocket, eventType: string, data: Record<string, any>) {
     if (ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({ event: eventType, ...data }));
     }
-  } catch {
-    // Client disconnected
-  }
+  } catch {}
+}
+
+/** Send an event via the session's current WS (handles reconnects) and record it for replay. */
+function sessionSend(session: ActiveSession, scenarioId: string, eventType: string, data: Record<string, any>) {
+  wsSendAndRecord(session, scenarioId, eventType, data);
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,10 +1566,11 @@ const PORT = parseInt(process.env.PORT || "8000");
 
 const httpServer = createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
+    const origin = getCorsOrigin(req);
     res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
+      ...(origin ? { "Access-Control-Allow-Origin": origin } : {}),
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
     });
     res.end();
     return;
@@ -1344,10 +1580,50 @@ const httpServer = createServer(async (req, res) => {
   const path = url.pathname;
 
   try {
+    // GET /api/health
+    if (req.method === "GET" && path === "/api/health") {
+      return jsonResponse(res, 200, { status: "ok", version: "1.0.0", boot_id: BOOT_ID }, req);
+    }
+
+    // GET /api/gstack/personas
+    if (req.method === "GET" && path === "/api/gstack/personas") {
+      const dirExists = existsSync(currentGstackDir);
+      const listing = gstackPersonas;
+      return jsonResponse(res, 200, {
+        available: dirExists && listing.length > 0,
+        path: currentGstackDir,
+        count: listing.length,
+        personas: listing,
+      }, req);
+    }
+
+    // POST /api/gstack/reload — reload personas from a new directory
+    if (req.method === "POST" && path === "/api/gstack/reload") {
+      const body = await parseBody(req);
+      const newPath = typeof body.path === "string" && body.path.trim() ? body.path.trim() : DEFAULT_GSTACK_DIR;
+      try {
+        const loaded = loadGstackPersonas(newPath);
+        gstackPersonas = loaded;
+        currentGstackDir = newPath;
+        return jsonResponse(res, 200, {
+          available: loaded.length > 0,
+          path: newPath,
+          count: loaded.length,
+          personas: loaded,
+        }, req);
+      } catch (err: any) {
+        return jsonResponse(res, 400, { detail: `Failed to load from ${newPath}: ${err.message}` }, req);
+      }
+    }
+
     // POST /api/scenarios
     if (req.method === "POST" && path === "/api/scenarios") {
       const body = await parseBody(req);
       const id = randomUUID().replace(/-/g, "").slice(0, 12);
+
+      // Extract API key from Authorization header
+      const authHeader = req.headers.authorization || "";
+      const bearerKey = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
 
       // Build variants array
       let variants: Variant[] = [];
@@ -1367,42 +1643,64 @@ const httpServer = createServer(async (req, res) => {
         variants,
         audience_desc: body.audience_desc || "",
         platforms: body.platforms || ["twitter", "reddit"],
-        agent_count: body.agent_count ?? 15,
+        agent_count: body.mode === "gstack" && Array.isArray(body.gstack_personas)
+          ? body.gstack_personas.reduce((sum: number, p: any) => sum + (parseInt(typeof p === "string" ? "1" : p.count) || 1), 0)
+          : (body.agent_count ?? 15),
         rounds: body.rounds ?? 5,
         model: body.model,
+        search_model: body.search_model,
+        mode: body.mode === "gstack" ? "gstack" : "normal",
+        gstack_personas: Array.isArray(body.gstack_personas)
+          ? body.gstack_personas.map((p: any) => {
+              // Support both old string[] format and new object format
+              if (typeof p === "string") return { skill_name: p, count: 1 };
+              return {
+                skill_name: String(p.skill_name || ""),
+                count: Math.max(1, Math.min(10, parseInt(p.count) || 1)),
+                ...(p.sentiment_bias != null ? { sentiment_bias: Number(p.sentiment_bias) } : {}),
+                ...(p.influence_weight != null ? { influence_weight: Number(p.influence_weight) } : {}),
+                ...(p.activity_level != null ? { activity_level: Number(p.activity_level) } : {}),
+              };
+            })
+          : [],
         status: "created",
         research_topics: Array.isArray(body.research_topics) ? body.research_topics.filter((t: any) => typeof t === "string" && t.trim()) : [],
+        ...(bearerKey ? { apiKey: bearerKey } : {}),
       };
       scenarios.set(id, scenario);
       saveHistory();
-      return jsonResponse(res, 200, scenario);
+
+      // Return scenario without the apiKey
+      const { apiKey: _omit, ...safeScenario } = scenario;
+      return jsonResponse(res, 200, safeScenario, req);
     }
 
     // GET /api/scenarios
     if (req.method === "GET" && path === "/api/scenarios") {
-      return jsonResponse(res, 200, [...scenarios.values()]);
+      return jsonResponse(res, 200, [...scenarios.values()].map(({ apiKey: _, ...s }) => s), req);
     }
 
     // GET /api/scenarios/:id
     const scenarioMatch = path.match(/^\/api\/scenarios\/([^/]+)$/);
     if (req.method === "GET" && scenarioMatch) {
       const s = scenarios.get(scenarioMatch[1]);
-      if (!s) return jsonResponse(res, 404, { detail: "Scenario not found" });
-      return jsonResponse(res, 200, s);
+      if (!s) return jsonResponse(res, 404, { detail: "Scenario not found" }, req);
+      const { apiKey: _, ...safe } = s;
+      return jsonResponse(res, 200, safe, req);
     }
 
     // GET /api/results/:id
     const resultsMatch = path.match(/^\/api\/results\/([^/]+)$/);
     if (req.method === "GET" && resultsMatch) {
       const r = results.get(resultsMatch[1]);
-      if (!r) return jsonResponse(res, 404, { detail: "Results not found" });
-      return jsonResponse(res, 200, r);
+      if (!r) return jsonResponse(res, 404, { detail: "Results not found" }, req);
+      return jsonResponse(res, 200, r, req);
     }
 
-    jsonResponse(res, 404, { detail: "Not found" });
+    jsonResponse(res, 404, { detail: "Not found" }, req);
   } catch (err: any) {
     console.error("HTTP error:", err);
-    jsonResponse(res, 500, { detail: err.message || "Internal server error" });
+    jsonResponse(res, 500, { detail: err.message || "Internal server error" }, req);
   }
 });
 
@@ -1427,15 +1725,71 @@ httpServer.on("upgrade", (req, socket, head) => {
         return;
       }
 
+      // Read per-user API key from query parameter (overrides the one from POST)
+      const wsKey = url.searchParams.get("apiKey") || url.searchParams.get("key");
+      if (wsKey) {
+        scenario.apiKey = wsKey;
+      }
+
+      console.log(`[ws] Scenario ${scenarioId}: apiKey from POST=${!!scenario.apiKey}, wsKey=${!!wsKey}`);
+
+      if (!scenario.apiKey) {
+        wsSend(ws, "simulation_error", { message: "No API key. Please log in again." });
+        ws.close();
+        return;
+      }
+
+      // Check if there's already a running simulation for this scenario
+      const existingSession = activeSessions.get(scenarioId);
+      if (existingSession && !existingSession.aborted) {
+        // Reconnect — swap the WS, cancel disconnect timer, replay state
+        console.log(`[ws] Reconnecting to running session ${scenarioId} (phase: ${existingSession.phase})`);
+        if (existingSession.disconnectTimer) {
+          clearTimeout(existingSession.disconnectTimer);
+          existingSession.disconnectTimer = null;
+        }
+        existingSession.ws = ws;
+
+        // Wire up message handler for the new WS
+        ws.on("message", (data) => {
+          try {
+            const msg = JSON.parse(data.toString());
+            const session = activeSessions.get(scenarioId);
+            if (msg.action === "confirm" && session?.confirmResolve) {
+              console.log(`[ws] Received confirmation from client (reconnected)`);
+              session.confirmResolve(true);
+            }
+          } catch {}
+        });
+
+        ws.on("close", () => {
+          console.log(`[ws] Client disconnected for scenario ${scenarioId}`);
+          const session = activeSessions.get(scenarioId);
+          if (session && session.ws === ws) {
+            // Grace period — keep simulation alive for 2 minutes in case user refreshes again
+            session.disconnectTimer = setTimeout(() => {
+              console.log(`[ws] No reconnect for ${scenarioId} after 2 min — aborting`);
+              abortSession(scenarioId);
+              scenario.status = "cancelled";
+            }, 120000);
+          }
+        });
+
+        // Replay current state to the new client
+        replayState(ws, existingSession, scenario);
+        return;
+      }
+
       scenario.status = "running";
 
       // Listen for client messages (confirmation, etc.)
       ws.on("message", (data) => {
         try {
           const msg = JSON.parse(data.toString());
-          if (msg.action === "confirm" && active.confirmResolve) {
+          const session = activeSessions.get(scenarioId);
+          if (msg.action === "confirm" && session?.confirmResolve) {
             console.log(`[ws] Received confirmation from client`);
-            active.confirmResolve(true);
+            session.confirmResolve(true);
           }
         } catch {}
       });
@@ -1443,11 +1797,14 @@ httpServer.on("upgrade", (req, socket, head) => {
       // Clean up if client disconnects mid-simulation
       ws.on("close", () => {
         console.log(`[ws] Client disconnected for scenario ${scenarioId}`);
-        if (active.ws === ws) {
-          // Cancel pending confirmation
-          if (active.confirmResolve) {
-            active.confirmResolve(false);
-          }
+        const session = activeSessions.get(scenarioId);
+        if (session && session.ws === ws) {
+          // Grace period — keep simulation alive for 2 minutes in case user refreshes
+          session.disconnectTimer = setTimeout(() => {
+            console.log(`[ws] No reconnect for ${scenarioId} after 2 min — aborting`);
+            abortSession(scenarioId);
+            scenario.status = "cancelled";
+          }, 120000);
         }
       });
 
@@ -1456,12 +1813,21 @@ httpServer.on("upgrade", (req, socket, head) => {
           console.error("Simulation error:", err);
           scenario.status = "error";
           saveHistory();
-          wsSend(ws, "error", { message: String(err.message || err) });
+          // Use sessionSend to reach the current WS (may have been swapped by reconnect)
+          const session = activeSessions.get(scenarioId);
+          if (session) {
+            sessionSend(session, scenarioId, "simulation_error", { message: String(err.message || err) });
+          } else {
+            wsSend(ws, "simulation_error", { message: String(err.message || err) });
+          }
         })
         .finally(() => {
-          try {
-            ws.close();
-          } catch {}
+          // Small delay so the error event reaches the client before close
+          const session = activeSessions.get(scenarioId);
+          const currentWs = session?.ws || ws;
+          setTimeout(() => {
+            try { currentWs.close(); } catch {}
+          }, 500);
         });
     });
   } else {

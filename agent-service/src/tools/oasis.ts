@@ -13,7 +13,7 @@ const VENV_PYTHON = join(import.meta.dirname, "..", "..", ".venv", "bin", "pytho
 // Run OASIS Simulation
 // ---------------------------------------------------------------------------
 
-export function createRunOasisTool(defaultWorkDir: string): AgentTool {
+export function createRunOasisTool(defaultWorkDir: string, opts?: { apiKey?: string; modelId?: string }): AgentTool {
   return {
     name: "run_oasis_simulation",
     label: "Run OASIS Simulation",
@@ -84,7 +84,21 @@ export function createRunOasisTool(defaultWorkDir: string): AgentTool {
       ];
 
       return new Promise<AgentToolResult<void>>((resolve) => {
-        const child = spawn(VENV_PYTHON, args, { cwd: workDir });
+        // BYOK key takes priority, then fall back to .env / process.env
+        const effectiveKey = opts?.apiKey || process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY || "";
+        console.log(`[oasis] Spawning OASIS: apiKey=${effectiveKey ? "set (" + effectiveKey.slice(0, 12) + "...)" : "MISSING"}`);
+        const child = spawn(VENV_PYTHON, args, {
+          cwd: workDir,
+          env: {
+            ...process.env,
+            ...(effectiveKey ? {
+              OPENAI_API_KEY: effectiveKey,
+              OPENROUTER_API_KEY: effectiveKey,
+              OPENAI_BASE_URL: "https://openrouter.ai/api/v1",
+            } : {}),
+            ...(opts?.modelId ? { CS_LLM_MODEL: opts.modelId } : {}),
+          },
+        });
         const stderrChunks: string[] = [];
         const summaryLines: string[] = [];
 

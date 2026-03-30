@@ -8,6 +8,7 @@
  */
 import { reactive, computed } from 'vue'
 import { connectWS } from '../api'
+import { useAuth } from './useAuth'
 
 // Tool icons — matches x-lens style
 const TOOL_ICONS = {
@@ -364,6 +365,8 @@ function handleEvent(msg) {
       state.simulationComplete = true
       state.phase = 'complete'
       state.phaseLabel = 'Simulation complete'
+      // Refresh usage info after simulation
+      try { useAuth().refreshUserInfo() } catch {}
       break
 
     case 'simulation_error': {
@@ -387,15 +390,19 @@ function handleEvent(msg) {
 function connect(scenarioId) {
   if (ws && state.scenarioId === scenarioId && ws.readyState <= 1) return
 
+  // If reconnecting to the same scenario (e.g. page refresh), don't reset state
+  const isReconnect = state.scenarioId === scenarioId && state.phase !== 'idle'
   disconnect()
-  reset()
+  if (!isReconnect) {
+    reset()
+    state.phase = 'researching'
+    state.phaseLabel = 'Researching...'
+  }
   state.scenarioId = scenarioId
-  state.phase = 'researching'
-  state.phaseLabel = 'Researching...'
 
   ws = connectWS(scenarioId)
 
-  ws.onopen = () => addEntry('info', 'connected to simulation pipeline')
+  ws.onopen = () => addEntry('info', isReconnect ? 'reconnected to simulation' : 'connected to simulation pipeline')
 
   ws.onmessage = (e) => {
     let msg
