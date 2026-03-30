@@ -17,11 +17,20 @@ import {
   createRunOasisTool,
   createReadResultsTool,
 } from "./tools/index.js";
+import { loadGstackPersonas, type GstackPersona } from "./gstack.js";
 
 
 interface Variant {
   id: string;   // "A", "B", "C"
   text: string;
+}
+
+interface GstackPersonaSelection {
+  skill_name: string;
+  count: number;                    // 1-10, how many variants to spawn
+  sentiment_bias?: number;          // override, -1.0 to 1.0
+  influence_weight?: number;        // override, 0.5 to 5.0
+  activity_level?: number;          // override, 0.1 to 1.0
 }
 
 interface Scenario {
@@ -34,6 +43,8 @@ interface Scenario {
   rounds: number;
   model?: string;
   search_model?: string;
+  mode?: "normal" | "gstack";
+  gstack_personas?: GstackPersonaSelection[];  // was string[]
   status: string;
   research_topics: string[];  // user-specified research angles
   apiKey?: string;            // per-user OpenRouter API key (never persisted)
@@ -74,6 +85,7 @@ interface ActiveSession {
 // ---------------------------------------------------------------------------
 
 const DATA_DIR = join(process.cwd(), "data");
+const BOOT_ID = randomUUID().slice(0, 8);
 const CROWDSIM_HOME = join(homedir(), ".crowdsim");
 const HISTORY_FILE = join(CROWDSIM_HOME, "history.json");
 
@@ -112,6 +124,19 @@ async function saveHistory() {
 }
 
 loadHistory();
+
+// ---------------------------------------------------------------------------
+// Load gstack personas (if directory exists)
+// ---------------------------------------------------------------------------
+
+const GSTACK_DIR = process.env.GSTACK_DIR || join(homedir(), "Documents/Workspace/personal-assist/gstack");
+let gstackPersonas: GstackPersona[] = [];
+try {
+  gstackPersonas = loadGstackPersonas(GSTACK_DIR);
+  console.log(`[gstack] ${gstackPersonas.length} personas available`);
+} catch (err) {
+  console.warn("[gstack] Failed to load personas:", err);
+}
 
 // ---------------------------------------------------------------------------
 // Per-simulation active session — each simulation creates its own
@@ -659,7 +684,7 @@ function createAgentForSimulation(active: ActiveSession, apiKey?: string, userMo
     },
     convertToLlm,
     transformContext,
-    getApiKey: apiKey ? () => apiKey : undefined,
+    getApiKey: () => apiKey || process.env.OPENROUTER_API_KEY || "",
   });
 
   // Subscribe with the session-scoped `active` state
@@ -744,6 +769,7 @@ async function runOasisDirect(
   postText: string,
   workDir: string,
   active: ActiveSession,
+  apiKey?: string,
 ): Promise<void> {
   const profilesPath = join(workDir, `profiles_${platform}.json`);
   await writeFile(profilesPath, JSON.stringify(profiles, null, 2));
@@ -774,7 +800,18 @@ async function runOasisDirect(
   });
 
   return new Promise<void>((resolve, reject) => {
-    const child = spawn(VENV_PYTHON, args, { cwd: workDir });
+    const effectiveKey = apiKey || process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY || "";
+    const child = spawn(VENV_PYTHON, args, {
+      cwd: workDir,
+      env: {
+        ...process.env,
+        ...(effectiveKey ? {
+          OPENAI_API_KEY: effectiveKey,
+          OPENROUTER_API_KEY: effectiveKey,
+          OPENAI_BASE_URL: "https://openrouter.ai/api/v1",
+        } : {}),
+      },
+    });
     const stderrChunks: string[] = [];
 
     const rl = createInterface({ input: child.stdout });
@@ -831,6 +868,107 @@ async function runOasisDirect(
 }
 
 // ---------------------------------------------------------------------------
+// gstack Phase 1 prompt builder
+// ---------------------------------------------------------------------------
+
+function buildGstackPhase1Prompt(scenario: Scenario, workDir: string): string {
+  const selections = scenario.gstack_personas || [];
+  if (selections.length === 0) {
+    throw new Error("No gstack personas selected. Pick at least one team member.");
+  }
+
+  // Match selections to loaded personas, apply overrides
+  const enriched = selections.map(sel => {
+    const base = gstackPersonas.find(p => p.skill_name === sel.skill_name);
+    if (!base) return null;
+    return {
+      ...base,
+      count: sel.count || 1,
+      sentiment_bias: sel.sentiment_bias ?? base.sentiment_bias,
+      influence_weight: sel.influence_weight ?? base.influence_weight,
+      activity_level: sel.activity_level ?? base.activity_level,
+    };
+  }).filter(Boolean) as (GstackPersona & { count: number })[];
+
+  if (enriched.length === 0) {
+    throw new Error("No matching gstack personas found for the selected skill names.");
+  }
+
+  const totalAgents = enriched.reduce((sum, p) => sum + p.count, 0);
+
+  const personaDescriptions = enriched.map((p, i) => `
+### Persona ${i}: ${p.display_name} (${p.skill_name}) — GENERATE ${p.count} VARIANT${p.count > 1 ? "S" : ""}
+**Role:** ${p.profession}
+**Archetype:** ${p.archetype}
+**sentiment_bias:** ${p.sentiment_bias}${p.count > 1 ? ` (jitter each variant ±0.15, stay within -1.0 to 1.0)` : ""}
+**influence_weight:** ${p.influence_weight}${p.count > 1 ? ` (jitter each variant ±0.3, stay within 0.5 to 5.0)` : ""}
+**activity_level:** ${p.activity_level}${p.count > 1 ? ` (jitter each variant ±0.1, stay within 0.1 to 1.0)` : ""}
+**Interested topics:** ${p.interested_topics.join(", ")}
+**Expertise:** ${p.description}
+`).join("\n---\n");
+
+  const isAB = scenario.variants.length > 1;
+  const postTextSection = isAB
+    ? scenario.variants.map(v => `VARIANT ${v.id}: "${v.text}"`).join("\n\n")
+    : `POST TEXT: "${scenario.post_text}"`;
+
+  return `Run a crowd simulation for this scenario using PRE-DEFINED TEAM PERSONAS.
+
+SCENARIO ID: ${scenario.id}
+
+${postTextSection}
+
+AUDIENCE DESCRIPTION: "${scenario.audience_desc || "expert tech team"}"
+
+PLATFORMS: ${scenario.platforms.join(" and ")}
+NUMBER OF AGENTS: ${totalAgents}
+SIMULATION ROUNDS: ${scenario.rounds || 5}
+WORK DIRECTORY: ${workDir}
+${isAB ? `\nA/B TEST MODE: Testing ${scenario.variants.length} variants. Research covers ALL variants. Same team reacts to each.\n` : ""}
+
+MODE: GSTACK TEAM SIMULATION
+You are simulating how a team of expert specialists would react to this post.
+These are not random internet users — they are opinionated professionals with specific expertise.
+
+STEP 1 — RESEARCH THE TOPIC:
+Conduct AT LEAST 10-15 web_search queries to understand the topic context:
+- Current discourse and opinions on this topic (3-4 searches)
+- Recent news and events (2-3 searches)
+- Technical context relevant to the team roles (2-3 searches)
+- Controversy, risks, or counterarguments (2-3 searches)
+${scenario.research_topics.length > 0 ? `\nUSER-SPECIFIED RESEARCH TOPICS (MUST research):\n${scenario.research_topics.map(t => `- ${t}`).join("\n")}\n` : ""}
+
+After research, output a structured research summary in a \`\`\`research_summary code fence.
+
+STEP 2 — ENRICH AND MULTIPLY THESE PRE-DEFINED PERSONAS WITH YOUR RESEARCH:
+Below are ${enriched.length} team personas. Some request MULTIPLE VARIANTS — you must generate the exact number specified.
+
+For personas requesting multiple variants (count > 1):
+- Each variant is a DISTINCT INDIVIDUAL within that role. Different name, age, gender, MBTI, backstory.
+- Slightly jitter their numeric traits as noted (sentiment_bias, influence_weight, activity_level).
+- Each variant should have a different perspective on the topic — e.g., 3 security people might focus on different risks (PCI compliance vs supply chain vs insider threats).
+- Each variant gets a unique \`agent_id\` (use format: "agent_<persona-index>_<variant-index>", e.g., "agent_0_0", "agent_0_1", "agent_0_2").
+
+For personas requesting a single variant (count = 1):
+- Generate one profile as before.
+- Use their traits EXACTLY as specified (no jitter).
+
+For EVERY profile:
+1. Keep their archetype EXACTLY as defined
+2. Write a \`persona\` field (2000+ chars) describing how THIS SPECIFIC PERSON would view THIS SPECIFIC TOPIC based on your research. Reference real findings. Write in first person.
+3. Write a \`research_basis\` explaining which research findings shaped their likely reaction
+4. Generate realistic \`name\`, \`username\`, \`bio\`, \`age\`, \`gender\`, \`mbti\`
+
+Output ALL ${totalAgents} enriched profiles as a single JSON array in a \`\`\`json code fence.
+Each profile must include ALL fields: agent_id, username, name, bio, persona, age, gender, mbti, profession, interested_topics, sentiment_bias, influence_weight, activity_level, archetype, research_basis.
+
+PRE-DEFINED PERSONAS:
+${personaDescriptions}
+
+DO NOT call run_oasis_simulation yet — the user needs to review and confirm the profiles first.`;
+}
+
+// ---------------------------------------------------------------------------
 // Simulation runner (two-phase pipeline with confirmation gate)
 // ---------------------------------------------------------------------------
 
@@ -879,7 +1017,9 @@ async function runSimulation(ws: WebSocket, scenario: Scenario) {
       : `POST TEXT: "${scenario.post_text}"`;
 
     // ── Phase 1: Research + Generate Profiles ──────────────────────────
-    const phase1Prompt = `Run a crowd simulation for this scenario:
+    const phase1Prompt = scenario.mode === "gstack"
+      ? buildGstackPhase1Prompt(scenario, workDir)
+      : `Run a crowd simulation for this scenario:
 
 SCENARIO ID: ${scenario.id}
 
@@ -1085,7 +1225,7 @@ DO NOT call run_oasis_simulation yet — the user needs to review and confirm th
 
       for (const plat of scenario.platforms) {
         try {
-          await runOasisDirect(ws, plat, profiles, simRounds, postText, variantDir, active);
+          await runOasisDirect(ws, plat, profiles, simRounds, postText, variantDir, active, scenario.apiKey);
         } catch (err: any) {
           console.error(`[sim] Platform ${plat} failed: ${err.message}`);
           wsSend(ws, "simulation_error", {
@@ -1368,7 +1508,19 @@ const httpServer = createServer(async (req, res) => {
   try {
     // GET /api/health
     if (req.method === "GET" && path === "/api/health") {
-      return jsonResponse(res, 200, { status: "ok", version: "1.0.0" }, req);
+      return jsonResponse(res, 200, { status: "ok", version: "1.0.0", boot_id: BOOT_ID }, req);
+    }
+
+    // GET /api/gstack/personas
+    if (req.method === "GET" && path === "/api/gstack/personas") {
+      const dirExists = existsSync(GSTACK_DIR);
+      const listing = gstackPersonas;
+      return jsonResponse(res, 200, {
+        available: dirExists && listing.length > 0,
+        path: GSTACK_DIR,
+        count: listing.length,
+        personas: listing,
+      }, req);
     }
 
     // POST /api/scenarios
@@ -1398,10 +1550,26 @@ const httpServer = createServer(async (req, res) => {
         variants,
         audience_desc: body.audience_desc || "",
         platforms: body.platforms || ["twitter", "reddit"],
-        agent_count: body.agent_count ?? 15,
+        agent_count: body.mode === "gstack" && Array.isArray(body.gstack_personas)
+          ? body.gstack_personas.reduce((sum: number, p: any) => sum + (parseInt(typeof p === "string" ? "1" : p.count) || 1), 0)
+          : (body.agent_count ?? 15),
         rounds: body.rounds ?? 5,
         model: body.model,
         search_model: body.search_model,
+        mode: body.mode === "gstack" ? "gstack" : "normal",
+        gstack_personas: Array.isArray(body.gstack_personas)
+          ? body.gstack_personas.map((p: any) => {
+              // Support both old string[] format and new object format
+              if (typeof p === "string") return { skill_name: p, count: 1 };
+              return {
+                skill_name: String(p.skill_name || ""),
+                count: Math.max(1, Math.min(10, parseInt(p.count) || 1)),
+                ...(p.sentiment_bias != null ? { sentiment_bias: Number(p.sentiment_bias) } : {}),
+                ...(p.influence_weight != null ? { influence_weight: Number(p.influence_weight) } : {}),
+                ...(p.activity_level != null ? { activity_level: Number(p.activity_level) } : {}),
+              };
+            })
+          : [],
         status: "created",
         research_topics: Array.isArray(body.research_topics) ? body.research_topics.filter((t: any) => typeof t === "string" && t.trim()) : [],
         ...(bearerKey ? { apiKey: bearerKey } : {}),
