@@ -155,7 +155,16 @@
 
                 <!-- Expanded controls (visible when selected) -->
                 <div class="gs-controls" v-if="personaConfig[p.skill_name]?.count > 0">
-                  <div class="gs-source">{{ p.folder_name }}/SKILL.md</div>
+                  <div class="gs-source-row">
+                    <span class="gs-source">{{ p.folder_name }}/SKILL.md</span>
+                    <button
+                      class="gs-desc-toggle"
+                      @click.stop="expandedDescs.has(p.skill_name) ? expandedDescs.delete(p.skill_name) : expandedDescs.add(p.skill_name)"
+                    >{{ expandedDescs.has(p.skill_name) ? 'hide' : 'show' }} description</button>
+                  </div>
+                  <div class="gs-desc-preview" v-if="expandedDescs.has(p.skill_name)">
+                    {{ p.description || 'No description in frontmatter' }}
+                  </div>
 
                   <!-- Multiplier stepper -->
                   <div class="gs-stepper-row">
@@ -373,7 +382,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { fetchGstackPersonas, reloadGstackPersonas } from '../api'
 import AudienceChips from './AudienceChips.vue'
 
@@ -418,6 +427,7 @@ const personaConfig = ref({})   // Map<skill_name, { count, sentiment_bias, infl
 const gstackLoading = ref(false)
 const gstackAvailable = ref(false)
 const gstackPath = ref('')
+const expandedDescs = reactive(new Set())  // skill_names with description expanded
 
 // Computed: list of selected skill_names (those with count >= 1 in personaConfig)
 const selectedPersonas = computed(() =>
@@ -1563,11 +1573,46 @@ function handleSubmit() {
   gap: 6px;
 }
 
+.gs-source-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+
 .gs-source {
   font-size: 10px;
   font-family: var(--mono, monospace);
   color: var(--text3);
-  margin-bottom: 2px;
+}
+
+.gs-desc-toggle {
+  font-size: 9px;
+  color: var(--text3);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 0;
+  transition: color 0.12s;
+}
+
+.gs-desc-toggle:hover {
+  color: var(--text2);
+}
+
+.gs-desc-preview {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text2);
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 4px;
+  white-space: pre-wrap;
+  max-height: 120px;
+  overflow-y: auto;
 }
 
 /* Stepper row */
