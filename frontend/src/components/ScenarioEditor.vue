@@ -10,6 +10,15 @@
               <span class="ed-mode-icon">{{ abMode ? '&#9635;' : '&#9634;' }}</span>
               A/B Test
             </button>
+            <div class="ed-size-toggle" v-if="!abMode">
+              <button
+                v-for="s in postSizes"
+                :key="s.id"
+                class="size-opt"
+                :class="{ active: postSize === s.id }"
+                @click="postSize = s.id"
+              >{{ s.label }}</button>
+            </div>
             <span class="post-count" v-if="!abMode">{{ postText.length }}/2000</span>
           </div>
         </div>
@@ -19,6 +28,7 @@
           <textarea
             v-model="postText"
             class="post-input"
+            :style="{ fontSize: postFontSize }"
             placeholder="Paste your post draft here..."
             maxlength="2000"
           ></textarea>
@@ -64,6 +74,137 @@
         </div>
 
         <div class="ed-right-scroll">
+          <!-- Simulation Mode -->
+          <div class="ed-field">
+            <label class="field-label">Simulation Mode</label>
+            <div class="ed-mode-toggle">
+              <button
+                class="mode-opt"
+                :class="{ active: simMode === 'normal' }"
+                @click="simMode = 'normal'"
+              >Normal</button>
+              <button
+                class="mode-opt"
+                :class="{ active: simMode === 'gstack' }"
+                @click="simMode = 'gstack'"
+              >gstack Team</button>
+            </div>
+            <div class="gs-path" v-if="simMode === 'gstack' && gstackAvailable">
+              {{ gstackPath }}
+            </div>
+          </div>
+
+          <!-- gstack Setup Required -->
+          <div class="ed-field" v-if="simMode === 'gstack' && !gstackAvailable">
+            <div class="gs-setup">
+              <div class="gs-setup-icon">&#9881;</div>
+              <div class="gs-setup-title">gstack not found</div>
+              <p class="gs-setup-desc">Clone the gstack repo to enable team personas:</p>
+              <code class="gs-setup-cmd">git clone https://github.com/garry/gstack.git \<br/>{{ gstackPath || '~/Documents/Workspace/personal-assist/gstack' }}</code>
+              <div class="gs-setup-tree">
+                <div class="gs-tree-label">Expected structure:</div>
+                <pre class="gs-tree">{{ gstackPath || 'gstack' }}/
+├── plan-ceo-review/
+│   └── SKILL.md
+├── office-hours/
+│   └── SKILL.md
+├── review/
+│   └── SKILL.md
+├── qa/
+│   └── SKILL.md
+├── cso/
+│   └── SKILL.md
+└── ...</pre>
+              </div>
+              <p class="gs-setup-hint">Set <code>GSTACK_DIR</code> env var to use a custom path.</p>
+            </div>
+          </div>
+
+          <!-- gstack Persona Picker -->
+          <div class="ed-field" v-if="simMode === 'gstack' && gstackAvailable">
+            <div class="field-label-row">
+              <label class="field-label">Team Personas</label>
+              <button class="gs-select-all" @click="selectAllPersonas">
+                {{ selectedPersonas.length === gstackPersonas.length ? 'Deselect all' : 'Select all' }}
+              </button>
+            </div>
+            <div class="gs-grid">
+              <div
+                v-for="p in gstackPersonas"
+                :key="p.skill_name"
+                class="gs-persona-wrap"
+                :class="{ active: personaConfig[p.skill_name]?.count > 0 }"
+              >
+                <button
+                  class="gs-persona-row"
+                  @click="togglePersona(p.skill_name)"
+                >
+                  <span class="gs-check">{{ personaConfig[p.skill_name]?.count > 0 ? '&#10003;' : '' }}</span>
+                  <span class="gs-name">{{ p.display_name }}</span>
+                  <span class="gs-arch">{{ p.archetype }}</span>
+                </button>
+
+                <!-- Expanded controls (visible when selected) -->
+                <div class="gs-controls" v-if="personaConfig[p.skill_name]?.count > 0">
+                  <div class="gs-source">{{ p.folder_name }}/SKILL.md</div>
+
+                  <!-- Multiplier stepper -->
+                  <div class="gs-stepper-row">
+                    <span class="gs-ctrl-label">count</span>
+                    <div class="gs-stepper">
+                      <button class="gs-step-btn" @click.stop="adjustCount(p.skill_name, -1)" :disabled="personaConfig[p.skill_name].count <= 1">&minus;</button>
+                      <span class="gs-step-val">{{ personaConfig[p.skill_name].count }}</span>
+                      <button class="gs-step-btn" @click.stop="adjustCount(p.skill_name, 1)" :disabled="personaConfig[p.skill_name].count >= 10">+</button>
+                    </div>
+                  </div>
+
+                  <!-- Sentiment bias slider -->
+                  <div class="gs-slider-row">
+                    <span class="gs-ctrl-label">sentiment</span>
+                    <input
+                      type="range"
+                      class="gs-slider"
+                      min="-1" max="1" step="0.1"
+                      :value="personaConfig[p.skill_name].sentiment_bias"
+                      @input="personaConfig[p.skill_name].sentiment_bias = parseFloat($event.target.value)"
+                      @click.stop
+                    />
+                    <span class="gs-slider-val">{{ personaConfig[p.skill_name].sentiment_bias.toFixed(1) }}</span>
+                  </div>
+
+                  <!-- Influence weight slider -->
+                  <div class="gs-slider-row">
+                    <span class="gs-ctrl-label">influence</span>
+                    <input
+                      type="range"
+                      class="gs-slider"
+                      min="0.5" max="5" step="0.5"
+                      :value="personaConfig[p.skill_name].influence_weight"
+                      @input="personaConfig[p.skill_name].influence_weight = parseFloat($event.target.value)"
+                      @click.stop
+                    />
+                    <span class="gs-slider-val">{{ personaConfig[p.skill_name].influence_weight.toFixed(1) }}</span>
+                  </div>
+
+                  <!-- Activity level slider -->
+                  <div class="gs-slider-row">
+                    <span class="gs-ctrl-label">activity</span>
+                    <input
+                      type="range"
+                      class="gs-slider"
+                      min="0.1" max="1" step="0.1"
+                      :value="personaConfig[p.skill_name].activity_level"
+                      @input="personaConfig[p.skill_name].activity_level = parseFloat($event.target.value)"
+                      @click.stop
+                    />
+                    <span class="gs-slider-val">{{ personaConfig[p.skill_name].activity_level.toFixed(1) }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="gs-count">{{ selectedPersonas.length }} personas · {{ totalGstackAgents }} agents total</div>
+          </div>
+
           <!-- Models -->
           <div class="ed-field">
             <label class="field-label">LLM Model</label>
@@ -165,7 +306,7 @@
           <!-- Agents + Rounds -->
           <div class="ed-field">
             <div class="ed-config-row">
-              <div class="cfg-group">
+              <div class="cfg-group" v-if="simMode !== 'gstack'">
                 <label class="field-label">Agents</label>
                 <div class="cfg-input-row">
                   <input
@@ -207,7 +348,12 @@
     <!-- Bottom: submit -->
     <div class="ed-bottom">
       <div class="ed-bottom-info" v-if="canSubmit">
-        {{ agentCount }} agents · {{ rounds }} rounds · {{ platforms.join(' + ') }}{{ abMode ? ` · ${variants.length} variants` : '' }}
+        <template v-if="simMode === 'gstack'">
+          {{ selectedPersonas.length }} personas ({{ totalGstackAgents }} agents) · {{ rounds }} rounds · {{ platforms.join(' + ') }}{{ abMode ? ` · ${variants.length} variants` : '' }}
+        </template>
+        <template v-else>
+          {{ agentCount }} agents · {{ rounds }} rounds · {{ platforms.join(' + ') }}{{ abMode ? ` · ${variants.length} variants` : '' }}
+        </template>
       </div>
       <button class="ed-submit" :disabled="!canSubmit" @click="handleSubmit">
         <span class="ed-submit-text">Simulate Crowd Reaction</span>
@@ -218,7 +364,8 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
+import { fetchGstackPersonas } from '../api'
 import AudienceChips from './AudienceChips.vue'
 
 const emit = defineEmits(['submit'])
@@ -255,6 +402,80 @@ const activeAngles = ref(defaultAngles.map(a => a.id))
 const modelInput = ref('x-ai/grok-4.1-fast')
 const searchModelInput = ref('perplexity/sonar')
 
+// gstack mode
+const simMode = ref('normal')
+const gstackPersonas = ref([])
+const personaConfig = ref({})   // Map<skill_name, { count, sentiment_bias, influence_weight, activity_level }>
+const gstackLoading = ref(false)
+const gstackAvailable = ref(false)
+const gstackPath = ref('')
+
+// Computed: list of selected skill_names (those with count >= 1 in personaConfig)
+const selectedPersonas = computed(() =>
+  Object.entries(personaConfig.value)
+    .filter(([, cfg]) => cfg.count > 0)
+    .map(([name]) => name)
+)
+
+// Computed: total agent count across all selected personas
+const totalGstackAgents = computed(() =>
+  Object.values(personaConfig.value)
+    .reduce((sum, cfg) => sum + (cfg.count > 0 ? cfg.count : 0), 0)
+)
+
+onMounted(async () => {
+  try {
+    gstackLoading.value = true
+    const data = await fetchGstackPersonas()
+    gstackAvailable.value = data.available
+    gstackPath.value = data.path || ''
+    gstackPersonas.value = data.personas || []
+    // Initialize config with defaults (count=0 means not selected)
+    const cfg = {}
+    for (const p of gstackPersonas.value) {
+      cfg[p.skill_name] = {
+        count: 0,
+        sentiment_bias: p.sentiment_bias,
+        influence_weight: p.influence_weight,
+        activity_level: p.activity_level,
+      }
+    }
+    personaConfig.value = cfg
+  } catch {
+    // gstack not available
+  } finally {
+    gstackLoading.value = false
+  }
+})
+
+function togglePersona(skillName) {
+  const cfg = personaConfig.value[skillName]
+  if (!cfg) return
+  cfg.count = cfg.count > 0 ? 0 : 1
+}
+
+function selectAllPersonas() {
+  const allSelected = selectedPersonas.value.length === gstackPersonas.value.length
+  for (const p of gstackPersonas.value) {
+    personaConfig.value[p.skill_name].count = allSelected ? 0 : 1
+  }
+}
+
+function adjustCount(skillName, delta) {
+  const cfg = personaConfig.value[skillName]
+  if (!cfg) return
+  cfg.count = Math.max(1, Math.min(10, cfg.count + delta))
+}
+
+// Post font size
+const postSize = ref('large')
+const postSizes = [
+  { id: 'small', label: 'S', css: '16px' },
+  { id: 'medium', label: 'M', css: '22px' },
+  { id: 'large', label: 'L', css: 'clamp(26px, 2.6vw, 38px)' },
+]
+const postFontSize = computed(() => postSizes.find(s => s.id === postSize.value)?.css || '22px')
+
 const agentPresets = [15, 50, 200, 1000, 10000]
 
 const platformOptions = [
@@ -264,6 +485,7 @@ const platformOptions = [
 
 const canSubmit = computed(() => {
   if (platforms.value.length === 0) return false
+  if (simMode.value === 'gstack' && selectedPersonas.value.length === 0) return false
   if (abMode.value) {
     return variants.value.every(v => v.text.trim().length > 0)
   }
@@ -359,6 +581,14 @@ function handleSubmit() {
     research_topics: buildResearchTopics(),
     model: modelInput.value.trim() || undefined,
     search_model: searchModelInput.value.trim() || undefined,
+    mode: simMode.value,
+    ...(simMode.value === 'gstack' ? {
+      gstack_personas: selectedPersonas.value.map(name => ({
+        skill_name: name,
+        ...personaConfig.value[name],
+      })),
+      agent_count: totalGstackAgents.value,
+    } : {}),
   }
   if (abMode.value) {
     payload.variants = variants.value.map(v => ({ id: v.id, text: v.text.trim() }))
@@ -996,5 +1226,363 @@ function handleSubmit() {
   }
   .cfg-presets { display: none; }
   .ed-bottom-info { display: none; }
+}
+
+/* Mode toggle */
+.ed-mode-toggle {
+  display: flex;
+  gap: 4px;
+  background: var(--panel-glass);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 3px;
+}
+
+.mode-opt {
+  flex: 1;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text3);
+  background: transparent;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.mode-opt.active {
+  background: var(--elevated-surface);
+  color: var(--text);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+
+.mode-opt:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+/* gstack persona picker */
+.gs-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+
+.gs-check {
+  width: 14px;
+  font-size: 10px;
+  color: var(--green);
+  flex-shrink: 0;
+}
+
+.gs-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  flex: 1;
+}
+
+.gs-arch {
+  font-size: 10px;
+  color: var(--text3);
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.gs-count {
+  font-size: 11px;
+  color: var(--text3);
+  margin-top: 6px;
+}
+
+.gs-select-all {
+  font-size: 10px;
+  color: var(--text3);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 0;
+}
+
+.gs-select-all:hover {
+  color: var(--text2);
+}
+
+/* Post size toggle */
+.ed-size-toggle {
+  display: flex;
+  gap: 2px;
+  background: var(--panel-glass);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 2px;
+}
+
+.size-opt {
+  width: 26px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text3);
+  background: transparent;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+
+.size-opt.active {
+  background: var(--elevated-surface);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+}
+
+.size-opt:hover:not(.active) {
+  color: var(--text2);
+}
+
+/* gstack setup */
+.gs-setup {
+  padding: 16px;
+  border-radius: 12px;
+  border: 1px dashed var(--border2);
+  background: var(--panel-glass);
+  text-align: center;
+}
+
+.gs-setup-icon {
+  font-size: 24px;
+  margin-bottom: 8px;
+  opacity: 0.5;
+}
+
+.gs-setup-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.gs-setup-desc {
+  font-size: 11px;
+  color: var(--text2);
+  margin-bottom: 10px;
+  line-height: 1.4;
+}
+
+.gs-setup-cmd {
+  display: block;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  color: var(--text);
+  text-align: left;
+  line-height: 1.5;
+  word-break: break-all;
+  margin-bottom: 12px;
+}
+
+.gs-setup-tree {
+  text-align: left;
+  margin-bottom: 10px;
+}
+
+.gs-tree-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text3);
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.gs-tree {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-family: var(--mono, monospace);
+  font-size: 10px;
+  color: var(--text2);
+  line-height: 1.5;
+  margin: 0;
+  overflow-x: auto;
+}
+
+.gs-setup-hint {
+  font-size: 10px;
+  color: var(--text3);
+  line-height: 1.4;
+}
+
+.gs-setup-hint code {
+  font-family: var(--mono, monospace);
+  font-size: 10px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+/* gstack folder path */
+.gs-path {
+  font-size: 10px;
+  font-family: var(--mono, monospace);
+  color: var(--text3);
+  margin-top: 6px;
+  word-break: break-all;
+  line-height: 1.3;
+}
+
+/* Persona wrap — replaces gs-persona button as container */
+.gs-persona-wrap {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-glass);
+  transition: all 0.12s;
+  overflow: hidden;
+}
+
+.gs-persona-wrap:hover {
+  border-color: var(--border2);
+}
+
+.gs-persona-wrap.active {
+  border-color: var(--green-border);
+  background: var(--green-bg);
+}
+
+.gs-persona-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  background: none;
+  border: none;
+  font: inherit;
+  color: inherit;
+}
+
+/* Expanded controls area */
+.gs-controls {
+  padding: 6px 12px 10px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.gs-source {
+  font-size: 10px;
+  font-family: var(--mono, monospace);
+  color: var(--text3);
+  margin-bottom: 2px;
+}
+
+/* Stepper row */
+.gs-stepper-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.gs-ctrl-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text3);
+  width: 58px;
+  flex-shrink: 0;
+}
+
+.gs-stepper {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.gs-step-btn {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: var(--panel-glass);
+  color: var(--text2);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.gs-step-btn:hover:not(:disabled) {
+  background: var(--elevated-surface);
+}
+
+.gs-step-btn:disabled {
+  opacity: 0.2;
+  cursor: not-allowed;
+}
+
+.gs-step-val {
+  min-width: 20px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+/* Slider rows */
+.gs-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.gs-slider {
+  flex: 1;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.gs-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--green);
+  border: 2px solid var(--elevated-surface);
+  cursor: pointer;
+}
+
+.gs-slider-val {
+  font-size: 10px;
+  font-weight: 600;
+  font-family: var(--mono, monospace);
+  color: var(--text2);
+  min-width: 28px;
+  text-align: right;
 }
 </style>
