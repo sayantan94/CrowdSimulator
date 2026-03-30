@@ -507,10 +507,12 @@ function handleAgentEvent(event: AgentEvent, active: ActiveSession, scenarioId: 
   // Record events even when WS is disconnected — they'll be replayed on reconnect
   switch (event.type) {
     case "agent_start":
-      send("phase", {
-        phase: "researching",
-        message: "Agent is researching context...",
-      });
+      if (active.phase === "researching") {
+        send("phase", {
+          phase: "researching",
+          message: "Agent is researching context...",
+        });
+      }
       break;
 
     case "tool_execution_start": {
