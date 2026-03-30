@@ -375,7 +375,7 @@
 </template>
 
 <script setup>
-import { onMounted, ref, computed, defineAsyncComponent } from 'vue'
+import { onMounted, ref, computed, watch, defineAsyncComponent } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from '../api'
 
@@ -581,6 +581,10 @@ async function handleRerun(rewriteText) {
 }
 
 onMounted(loadResults)
+
+watch(() => route.params.id, (newId, oldId) => {
+  if (newId && newId !== oldId) loadResults()
+})
 </script>
 
 <style scoped>

@@ -107,25 +107,19 @@
           <div class="ed-field" v-if="simMode === 'gstack' && !gstackAvailable">
             <div class="gs-setup">
               <div class="gs-setup-icon">&#9881;</div>
-              <div class="gs-setup-title">gstack not found</div>
-              <p class="gs-setup-desc">Clone the gstack repo to enable team personas:</p>
-              <code class="gs-setup-cmd">git clone https://github.com/garry/gstack.git \<br/>{{ gstackPath || '~/Documents/Workspace/personal-assist/gstack' }}</code>
+              <div class="gs-setup-title">No personas found</div>
+              <p class="gs-setup-desc">Clone <a class="gs-setup-link" href="https://github.com/garrytan/gstack" target="_blank" rel="noopener">github.com/garry/gstack</a> to the path above, or change the path and click Reload.</p>
               <div class="gs-setup-tree">
                 <div class="gs-tree-label">Expected structure:</div>
-                <pre class="gs-tree">{{ gstackPath || 'gstack' }}/
+                <pre class="gs-tree">{{ gstackPath }}/
 ├── plan-ceo-review/
-│   └── SKILL.md
-├── office-hours/
-│   └── SKILL.md
-├── review/
-│   └── SKILL.md
-├── qa/
 │   └── SKILL.md
 ├── cso/
 │   └── SKILL.md
+├── qa/
+│   └── SKILL.md
 └── ...</pre>
               </div>
-              <p class="gs-setup-hint">Set <code>GSTACK_DIR</code> env var to use a custom path.</p>
             </div>
           </div>
 
@@ -624,8 +618,8 @@ function handleSubmit() {
     agent_count: agentCount.value,
     rounds: rounds.value,
     research_topics: buildResearchTopics(),
-    model: modelInput.value.trim() || undefined,
-    search_model: searchModelInput.value.trim() || undefined,
+    model: modelInput.value.trim(),
+    search_model: searchModelInput.value.trim(),
     mode: simMode.value,
     ...(simMode.value === 'gstack' ? {
       gstack_personas: selectedPersonas.value.map(name => ({
@@ -1421,6 +1415,15 @@ function handleSubmit() {
   color: var(--text2);
   margin-bottom: 10px;
   line-height: 1.4;
+}
+
+.gs-setup-link {
+  color: var(--blue);
+  text-decoration: none;
+}
+
+.gs-setup-link:hover {
+  text-decoration: underline;
 }
 
 .gs-setup-cmd {

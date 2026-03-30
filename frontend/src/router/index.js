@@ -39,12 +39,19 @@ const router = createRouter({
   routes
 })
 
-router.beforeEach((to) => {
-  const { isAuthenticated } = useAuth()
+router.beforeEach(async (to) => {
+  const { isAuthenticated, authReady } = useAuth()
+
+  // Wait for boot_id check to finish before deciding
+  await authReady
 
   const publicRoutes = ['login', 'auth-callback']
   if (!publicRoutes.includes(to.name) && !isAuthenticated.value) {
     return { name: 'login' }
+  }
+  // If already authenticated and going to login, redirect to home
+  if (to.name === 'login' && isAuthenticated.value) {
+    return { name: 'compose' }
   }
 })
 

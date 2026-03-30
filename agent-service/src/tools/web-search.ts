@@ -79,7 +79,7 @@ export function createWebSearchTool(opts?: { searchModel?: string; apiKey?: stri
               "X-Title": "CrowdSimulator Web Search",
             },
             body: JSON.stringify({
-              model: opts?.searchModel || process.env.CS_SEARCH_MODEL || "perplexity/sonar",
+              model: opts?.searchModel || "perplexity/sonar",
               messages: [{ role: "user", content: query }],
             }),
             signal: controller.signal,

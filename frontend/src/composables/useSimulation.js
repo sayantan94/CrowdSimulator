@@ -390,15 +390,19 @@ function handleEvent(msg) {
 function connect(scenarioId) {
   if (ws && state.scenarioId === scenarioId && ws.readyState <= 1) return
 
+  // If reconnecting to the same scenario (e.g. page refresh), don't reset state
+  const isReconnect = state.scenarioId === scenarioId && state.phase !== 'idle'
   disconnect()
-  reset()
+  if (!isReconnect) {
+    reset()
+    state.phase = 'researching'
+    state.phaseLabel = 'Researching...'
+  }
   state.scenarioId = scenarioId
-  state.phase = 'researching'
-  state.phaseLabel = 'Researching...'
 
   ws = connectWS(scenarioId)
 
-  ws.onopen = () => addEntry('info', 'connected to simulation pipeline')
+  ws.onopen = () => addEntry('info', isReconnect ? 'reconnected to simulation' : 'connected to simulation pipeline')
 
   ws.onmessage = (e) => {
     let msg

@@ -122,10 +122,21 @@ cmd_start() {
     fi
   fi
 
+  local port
+  port=$(grep -oP 'PORT=\K\d+' "$BACKEND_DIR/.env" 2>/dev/null || echo 8000)
+
   echo ""
-  log "CrowdSimulator is running:"
-  log "  Frontend: ${BLUE}http://localhost:5173${NC}"
-  log "  Backend:  ${BLUE}http://localhost:$(grep -oP 'PORT=\K\d+' "$BACKEND_DIR/.env" 2>/dev/null || echo 8000)${NC}"
+  log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  log ""
+  log "  CrowdSimulator is running"
+  log ""
+  log "  ${BLUE}➜  http://localhost:5173/login${NC}"
+  log ""
+  log "  Backend:  http://localhost:${port}"
+  log "  Frontend: http://localhost:5173"
+  log ""
+  log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
 }
 
 cmd_stop() {

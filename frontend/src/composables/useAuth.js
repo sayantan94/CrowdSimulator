@@ -1,7 +1,8 @@
-import { ref, computed, watch } from 'vue'
+import { ref, computed } from 'vue'
 
 const STORAGE_KEY = 'cs-openrouter-key'
 const USER_KEY = 'cs-openrouter-user'
+const BOOT_KEY = 'cs-boot-id'
 
 const apiKey = ref(localStorage.getItem(STORAGE_KEY) || '')
 const userInfo = ref(JSON.parse(localStorage.getItem(USER_KEY) || 'null'))
@@ -31,6 +32,11 @@ function login(key) {
   }
   apiKey.value = key
   localStorage.setItem(STORAGE_KEY, key)
+  // Store current boot_id so we detect future restarts
+  const baseUrl = import.meta.env.VITE_API_BASE_URL || '/api'
+  fetch(`${baseUrl}/health`).then(r => r.json()).then(data => {
+    if (data.boot_id) localStorage.setItem(BOOT_KEY, data.boot_id)
+  }).catch(() => {})
   fetchUserInfo()
   return true
 }
@@ -52,15 +58,41 @@ function startOAuthFlow() {
   window.location.href = authUrl
 }
 
-// Validate stored key on load — clear if invalid
+// Boot check — clear auth if server restarted
+// This runs synchronously at module init; authReady resolves when check is done
+let _resolveReady
+const authReady = new Promise((resolve) => { _resolveReady = resolve })
+
 if (apiKey.value && !apiKey.value.startsWith('sk-or-')) {
   console.warn('[auth] Clearing invalid stored key')
   apiKey.value = ''
   userInfo.value = null
   localStorage.removeItem(STORAGE_KEY)
   localStorage.removeItem(USER_KEY)
-} else if (apiKey.value && !userInfo.value) {
-  fetchUserInfo()
+  _resolveReady()
+} else if (apiKey.value) {
+  const baseUrl = import.meta.env.VITE_API_BASE_URL || '/api'
+  fetch(`${baseUrl}/health`)
+    .then(r => r.json())
+    .then(data => {
+      const storedBoot = localStorage.getItem(BOOT_KEY)
+      if (data.boot_id && storedBoot && data.boot_id !== storedBoot) {
+        console.log('[auth] Server restarted, clearing session')
+        apiKey.value = ''
+        userInfo.value = null
+        localStorage.removeItem(STORAGE_KEY)
+        localStorage.removeItem(USER_KEY)
+      }
+      if (data.boot_id) {
+        localStorage.setItem(BOOT_KEY, data.boot_id)
+      }
+    })
+    .catch(() => {})
+    .finally(() => _resolveReady())
+
+  if (!userInfo.value) fetchUserInfo()
+} else {
+  _resolveReady()
 }
 
 function refreshUserInfo() {
@@ -72,6 +104,7 @@ export function useAuth() {
     apiKey,
     userInfo,
     isAuthenticated,
+    authReady,
     login,
     logout,
     startOAuthFlow,
