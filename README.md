@@ -12,13 +12,9 @@
 
 </div>
 
-> **Zero config. Bring your own key.** No `.env` files, no secrets to manage. Log in with your OpenRouter API key, pick your models, and simulate. 
+> **Zero config. Bring your own key.** No `.env` files, no secrets to manage. Log in with your OpenRouter API key, pick your models, and simulate.
 
 Predict how the internet will react to your post before you publish it. CrowdSimulator researches your topic in real-time, generates realistic audience personas grounded in actual web discourse, and simulates their reactions — arguments, support, pile-ons, and consensus.
-
-![CrowdSimulator — Research phase with persona generation](gstack-docs/img_2.png)
-![CrowdSimulator — Live simulation with agent interactions](gstack-docs/img.png)
-![CrowdSimulator — Strategy report and risk assessment](gstack-docs/img_4.png)
 
 ## Quick Start
 
@@ -36,124 +32,78 @@ cd CrowdSimulator
 # 4. Open http://localhost:5173 and log in with your OpenRouter key
 ```
 
-## Prerequisites
+### Prerequisites
 
 - **Node.js 20+** and npm
 - **Python 3.10+** with `venv` support
 - **OpenRouter API key** — [get one here](https://openrouter.ai/keys)
 
-## How It Works
+## The Pipeline
 
-```
-Login → Compose Post → AI Research → Persona Generation → Review → Simulation → Report
-```
+### 1. Compose your post
 
-1. **Login** — Enter your OpenRouter API key. The key stays in your browser's localStorage and is sent with each request to the local backend.
-2. **Compose** — Write your post, describe your audience, pick platforms (Twitter/Reddit), set agent count, rounds, and choose LLM/search models.
-3. **Research** — AI agent runs 15-20+ web searches on topic sentiment, breaking news, audience demographics, controversy risks, cultural context.
-4. **Persona Generation** — Generates diverse audience profiles (supporters, skeptics, trolls, journalists, influencers) grounded in research findings.
-5. **Review & Confirm** — Review generated personas and research sources before committing to simulation.
-6. **Simulation** — OASIS multi-agent framework runs the sim: agents react with likes, reposts, comments, follows, downvotes across rounds.
-7. **Report** — Sentiment score, risk assessment, virality prediction, faction breakdown, themes, strategy recommendations, suggested rewrite.
+Write the post you're considering publishing. Pick your platforms (Twitter, Reddit, or both), set how many agents to simulate and how many rounds of interaction. In **gstack Team** mode, choose from pre-built team personas — CEO, QA Lead, Security Officer — each with tunable sentiment, influence, and activity sliders.
+
+![Compose — write your post and tune team personas with trait sliders](gstack-docs/img_5.png)
+
+### 2. AI researches your topic
+
+Hit **Simulate Crowd Reaction** and the AI agent kicks off 15-20+ web searches — topic sentiment, breaking news, audience demographics, controversy risks, cultural context. You watch it happen in real-time in the terminal. Every source is logged and traceable.
+
+### 3. Personas are generated from research
+
+The research feeds into persona generation. Each agent gets a name, background, MBTI, profession, posting style, and a **research basis** explaining why they exist. These aren't random — they're grounded in what the AI found on the web about who actually cares about your topic.
+
+![Research — search results on the left, grounded persona cards on the right](gstack-docs/img_2.png)
+
+### 4. Review and confirm
+
+Before burning tokens on simulation, you review every persona. See their research basis, interests, sentiment bias, and full persona text. Add or remove agents. When you're satisfied, confirm.
+
+### 5. Agents debate across platforms
+
+OASIS multi-agent framework takes over. Agents post, reply, like, repost, follow, and downvote across Twitter and Reddit — each making LLM-driven decisions based on their persona. The simulation view streams actions in real-time with an interaction graph, engagement breakdown, and activity feed.
+
+![Simulate — live multi-agent debate with interaction graph and engagement metrics](gstack-docs/img.png)
+
+### 6. Get your report
+
+When the dust settles, you get a full analysis: sentiment score, risk assessment (1-10), a verdict, faction breakdown, reaction themes, numbered strategy recommendations, and a suggested rewrite of your original post. One click to re-run with the rewrite.
+
+![Results — sentiment, risk score, strategy recommendations, and suggested rewrite](gstack-docs/img_4.png)
 
 ## gstack Team Mode
 
-CrowdSimulator integrates with [gstack](https://github.com/garrytan/gstack) — a collection of AI agent skills used by engineering teams. In gstack mode, simulation personas are derived from real team roles defined in gstack's `SKILL.md` files instead of being generated from scratch.
+CrowdSimulator integrates with [gstack](https://github.com/garrytan/gstack) — AI agent skills used by engineering teams. In gstack mode, personas come from real team roles defined in `SKILL.md` files instead of being generated from scratch.
 
-### Compose — Select Your Team
-
-Toggle **gstack Team** in the Settings panel. CrowdSimulator reads your local gstack directory, parses each skill's `SKILL.md` frontmatter (name, description, tier), and maps them to simulation personas with pre-tuned traits.
-
-![gstack Team mode — compose with persona list](gstack-docs/img_1.png)
-
-### Available Personas
-
-Each persona's expertise is pulled directly from its `SKILL.md` description field, grounding agent behavior in the same role definitions your team already uses.
-
-| Persona | Archetype | Source Folder | What They Bring |
-|---------|-----------|---------------|-----------------|
+| Persona | Archetype | Source | What They Bring |
+|---------|-----------|--------|-----------------|
 | CEO / Founder | strategist | `plan-ceo-review/` | Product strategy, growth, market fit |
 | YC Office Hours Mentor | skeptic | `office-hours/` | Forcing questions, PMF reality checks |
 | Engineering Manager | expert | `plan-eng-review/` | Architecture, execution, tech debt |
 | QA Lead | adversary | `qa/` | Testing, edge cases, regression |
 | Chief Security Officer | guardian | `cso/` | OWASP, STRIDE, supply chain, compliance |
 
-### Per-Persona Multiplier & Editable Traits
-
-Each persona can be multiplied (1-10x) — selecting CEO x2 spawns 2 distinct strategist agents from the same blueprint with jittered traits. Three sliders per persona let you tune behavior:
-
-- **sentiment** (-1.0 to 1.0) — how positive or negative the agent skews
-- **influence** (0.5 to 5.0) — how much their posts affect others
-- **activity** (0.1 to 1.0) — how frequently they post and react
-
-![gstack persona controls — multiplier and trait sliders](gstack-docs/img_5.png)
-
-### Research — Grounded Personas
-
-The AI agent researches your topic, then generates persona variants grounded in both the gstack role definition and live web research. Each persona card shows its research basis, interests, and full persona text.
-
-![gstack research phase — search results and persona cards](gstack-docs/img_2.png)
-
-### Simulate — Watch Your Team React
-
-Agents debate across Twitter and Reddit. The simulation view shows live comments, an interaction graph, engagement breakdown, and activity feed in real-time.
-
-![gstack simulation — live agent interactions](gstack-docs/img_3.png)
-![gstack simulation — full dashboard with Twitter and Reddit](gstack-docs/img.png)
-
-### Results — Risk Assessment & Strategy
-
-The final report includes sentiment analysis, a risk score, a verdict, actionable strategy recommendations, and a suggested rewrite of your original post.
-
-![gstack results — simulation report with strategy](gstack-docs/img_4.png)
-
-### Configurable gstack Path
-
-The gstack folder location is editable in the UI. Point it at any local clone of gstack and hit **Reload** to pick up new or modified skills.
+Each persona can be multiplied (1-10x) — CEO x2 spawns 2 distinct strategist agents with jittered traits. The gstack folder path is editable in the UI; point it at any local clone and hit **Reload**.
 
 ```bash
-# Default location
-~/Documents/gstack
-
-# Clone if you don't have it
 git clone https://github.com/garrytan/gstack.git ~/Documents/gstack
 ```
 
 ## Authentication
 
-CrowdSimulator uses a **Bring Your Own Key (BYOK)** model. Your OpenRouter API key:
-
-- Is entered in the browser at login
-- Is stored in your browser's localStorage
-- Is sent to the local backend per-request via `Authorization: Bearer` header (HTTP) and query parameter (WebSocket)
-- Is passed through to OpenRouter for LLM calls and to the OASIS Python subprocess for simulation
-- Never leaves your machine (browser → local backend → OpenRouter API)
+CrowdSimulator uses a **Bring Your Own Key (BYOK)** model. Your OpenRouter API key is entered in the browser, stored in localStorage, and passed through to OpenRouter for LLM calls. It never leaves your machine (browser → local backend → OpenRouter API).
 
 ## Model Selection
-
-You choose both models from the frontend when composing a scenario:
 
 | Setting | What it does | Default |
 |---|---|---|
 | **LLM Model** | Research, persona generation, analysis | `x-ai/grok-4.1-fast` |
 | **Search Model** | Real-time web search via Perplexity | `perplexity/sonar` |
 
-Browse available models at [openrouter.ai/models](https://openrouter.ai/models). Any model ID from OpenRouter works.
-
-## Setup
-
-`./crowdsim setup` handles everything automatically:
-
-1. Installs backend Node dependencies (`agent-service/`)
-2. Creates a Python virtual environment (`agent-service/.venv/`)
-3. Installs Python packages from `requirements.txt` (OASIS framework, camel-ai, etc.)
-4. Installs frontend Node dependencies (`frontend/`)
-
-Run `./crowdsim doctor` to verify everything is ready.
+Any model ID from [openrouter.ai/models](https://openrouter.ai/models) works.
 
 ## CLI Commands
-
-All management is done through the `./crowdsim` script in the project root:
 
 ```bash
 ./crowdsim setup     # Install all dependencies (npm + pip)
@@ -164,8 +114,6 @@ All management is done through the `./crowdsim` script in the project root:
 ./crowdsim logs      # View recent logs (also: logs backend, logs frontend)
 ./crowdsim doctor    # Diagnose setup issues (Node, Python, deps, ports)
 ```
-
-Services run in the background. Logs are written to `.pids/backend.log` and `.pids/frontend.log`.
 
 ## Tech Stack
 
@@ -195,7 +143,7 @@ CrowdSimulator/
 │   │   └── tools/            # Agent tools (web search, fetch, oasis, shell)
 │   ├── scripts/              # Python scripts (run_oasis.py, read_results.py)
 │   └── requirements.txt      # Python dependencies (camel-ai, OASIS)
-├── gstack-docs/              # Screenshots for gstack mode documentation
+├── gstack-docs/              # Screenshots
 └── docs/                     # Design docs and plans
 ```
 
