@@ -129,10 +129,11 @@ loadHistory();
 // Load gstack personas (if directory exists)
 // ---------------------------------------------------------------------------
 
-const GSTACK_DIR = process.env.GSTACK_DIR || join(homedir(), "Documents/Workspace/personal-assist/gstack");
+const DEFAULT_GSTACK_DIR = process.env.GSTACK_DIR || join(homedir(), "Documents/Workspace/personal-assist/gstack");
+let currentGstackDir = DEFAULT_GSTACK_DIR;
 let gstackPersonas: GstackPersona[] = [];
 try {
-  gstackPersonas = loadGstackPersonas(GSTACK_DIR);
+  gstackPersonas = loadGstackPersonas(currentGstackDir);
   console.log(`[gstack] ${gstackPersonas.length} personas available`);
 } catch (err) {
   console.warn("[gstack] Failed to load personas:", err);
@@ -1513,14 +1514,33 @@ const httpServer = createServer(async (req, res) => {
 
     // GET /api/gstack/personas
     if (req.method === "GET" && path === "/api/gstack/personas") {
-      const dirExists = existsSync(GSTACK_DIR);
+      const dirExists = existsSync(currentGstackDir);
       const listing = gstackPersonas;
       return jsonResponse(res, 200, {
         available: dirExists && listing.length > 0,
-        path: GSTACK_DIR,
+        path: currentGstackDir,
         count: listing.length,
         personas: listing,
       }, req);
+    }
+
+    // POST /api/gstack/reload — reload personas from a new directory
+    if (req.method === "POST" && path === "/api/gstack/reload") {
+      const body = await parseBody(req);
+      const newPath = typeof body.path === "string" && body.path.trim() ? body.path.trim() : DEFAULT_GSTACK_DIR;
+      try {
+        const loaded = loadGstackPersonas(newPath);
+        gstackPersonas = loaded;
+        currentGstackDir = newPath;
+        return jsonResponse(res, 200, {
+          available: loaded.length > 0,
+          path: newPath,
+          count: loaded.length,
+          personas: loaded,
+        }, req);
+      } catch (err: any) {
+        return jsonResponse(res, 400, { detail: `Failed to load from ${newPath}: ${err.message}` }, req);
+      }
     }
 
     // POST /api/scenarios

@@ -18,6 +18,16 @@ api.interceptors.request.use((config) => {
 
 export default api
 
+export async function fetchGstackPersonas() {
+  const res = await api.get('/gstack/personas')
+  return res.data
+}
+
+export async function reloadGstackPersonas(path) {
+  const res = await api.post('/gstack/reload', { path })
+  return res.data
+}
+
 export function connectWS(scenarioId) {
   const { apiKey } = useAuth()
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'

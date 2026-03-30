@@ -89,8 +89,17 @@
                 @click="simMode = 'gstack'"
               >gstack Team</button>
             </div>
-            <div class="gs-path" v-if="simMode === 'gstack' && gstackAvailable">
-              {{ gstackPath }}
+            <div class="gs-path-row" v-if="simMode === 'gstack'">
+              <input
+                v-model="gstackPath"
+                class="gs-path-input"
+                placeholder="Path to gstack directory"
+                spellcheck="false"
+                @keydown.enter.prevent="reloadGstack"
+              />
+              <button class="gs-path-reload" @click="reloadGstack" :disabled="gstackLoading">
+                {{ gstackLoading ? '...' : 'Reload' }}
+              </button>
             </div>
           </div>
 
@@ -365,7 +374,7 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { fetchGstackPersonas } from '../api'
+import { fetchGstackPersonas, reloadGstackPersonas } from '../api'
 import AudienceChips from './AudienceChips.vue'
 
 const emit = defineEmits(['submit'])
@@ -447,6 +456,32 @@ onMounted(async () => {
     gstackLoading.value = false
   }
 })
+
+async function reloadGstack() {
+  try {
+    gstackLoading.value = true
+    const data = await reloadGstackPersonas(gstackPath.value)
+    gstackAvailable.value = data.available
+    gstackPath.value = data.path || ''
+    gstackPersonas.value = data.personas || []
+    // Re-initialize config, preserving counts for personas that still exist
+    const oldCfg = personaConfig.value
+    const cfg = {}
+    for (const p of gstackPersonas.value) {
+      cfg[p.skill_name] = oldCfg[p.skill_name] || {
+        count: 0,
+        sentiment_bias: p.sentiment_bias,
+        influence_weight: p.influence_weight,
+        activity_level: p.activity_level,
+      }
+    }
+    personaConfig.value = cfg
+  } catch (err) {
+    console.error('Failed to reload gstack:', err)
+  } finally {
+    gstackLoading.value = false
+  }
+}
 
 function togglePersona(skillName) {
   const cfg = personaConfig.value[skillName]
@@ -1435,14 +1470,56 @@ function handleSubmit() {
   border: 1px solid var(--border);
 }
 
-/* gstack folder path */
-.gs-path {
+/* gstack path override */
+.gs-path-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  align-items: center;
+}
+
+.gs-path-input {
+  flex: 1;
+  padding: 6px 8px;
   font-size: 10px;
   font-family: var(--mono, monospace);
+  color: var(--text2);
+  background: var(--panel-glass);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  outline: none;
+  transition: border-color 0.12s;
+}
+
+.gs-path-input:focus {
+  border-color: var(--border2);
+}
+
+.gs-path-input::placeholder {
   color: var(--text3);
-  margin-top: 6px;
-  word-break: break-all;
-  line-height: 1.3;
+}
+
+.gs-path-reload {
+  padding: 5px 10px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text2);
+  background: var(--panel-glass);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.12s;
+  white-space: nowrap;
+}
+
+.gs-path-reload:hover:not(:disabled) {
+  border-color: var(--border2);
+  color: var(--text);
+}
+
+.gs-path-reload:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
 }
 
 /* Persona wrap — replaces gs-persona button as container */
